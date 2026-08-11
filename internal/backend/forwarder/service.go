@@ -37,6 +37,8 @@ const (
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
 
+	executePlanDirective = "Execute the current plan now. Start implementing it immediately instead of discussing or revising the plan."
+
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
 
@@ -2763,6 +2765,8 @@ func extractUserMessage(message *agentv1.AgentClientMessage) *agentv1.UserMessag
 		return item.UserMessageAction.GetUserMessage()
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
 	default:
 		return nil
 	}
@@ -2878,6 +2882,8 @@ func extractConversationActionUserMessage(action *agentv1.ConversationAction) *a
 		return item.UserMessageAction.GetUserMessage()
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
 	default:
 		return nil
 	}
