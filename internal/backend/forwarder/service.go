@@ -3540,7 +3540,7 @@ func recentlyCompletedExecExists(stream *ActiveStream, messageID uint32) bool {
 }
 
 func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, requestContext *agentv1.RequestContext) {
-	if stream == nil {
+	if stream == nil || !hasMCPDescriptorSnapshot(requestContext) {
 		return
 	}
 	servers := collectMCPToolServers(requestContext)
@@ -3548,6 +3548,11 @@ func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, request
 	stream.MCPToolServers = cloneStringMap(servers)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+}
+
+func hasMCPDescriptorSnapshot(requestContext *agentv1.RequestContext) bool {
+	return requestContext != nil &&
+		(requestContext.GetMcpFileSystemOptions() != nil || requestContext.GetMcpMetaToolOptions() != nil)
 }
 
 func snapshotStreamMCPToolServers(stream *ActiveStream) map[string]string {

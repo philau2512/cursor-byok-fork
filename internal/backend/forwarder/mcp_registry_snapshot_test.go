@@ -53,6 +53,67 @@ func TestMCPRegistrySnapshotRemovesDisabledServers(t *testing.T) {
 	}
 }
 
+func TestMCPRegistrySnapshotRetainsPriorSnapshotWithoutMCPContext(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestContext *agentv1.RequestContext
+	}{
+		{
+			name: "nil request context",
+		},
+		{
+			name:           "request context without MCP options",
+			requestContext: &agentv1.RequestContext{},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			stream := &ActiveStream{}
+			service := &Service{}
+			service.updateStreamMCPToolServers(stream, &agentv1.RequestContext{
+				McpFileSystemOptions: &agentv1.McpFileSystemOptions{
+					McpDescriptors: []*agentv1.McpDescriptor{{
+						ServerIdentifier: "user-fast-context",
+						ServerName:       "fast-context",
+						Tools:            []*agentv1.McpToolDescriptor{{ToolName: "fast_context_search"}},
+					}},
+				},
+			})
+
+			service.updateStreamMCPToolServers(stream, testCase.requestContext)
+
+			if server := lookupMCPToolServer(stream, "fast_context_search"); server != "user-fast-context" {
+				t.Fatalf("MCP tool server after request without MCP context = %q, want user-fast-context", server)
+			}
+			if server := lookupMCPToolServer(stream, "fast-context"); server != "user-fast-context" {
+				t.Fatalf("MCP server alias after request without MCP context = %q, want user-fast-context", server)
+			}
+		})
+	}
+}
+
+func TestMCPRegistrySnapshotClearsExplicitEmptyMCPDescriptorList(t *testing.T) {
+	stream := &ActiveStream{}
+	service := &Service{}
+	service.updateStreamMCPToolServers(stream, &agentv1.RequestContext{
+		McpFileSystemOptions: &agentv1.McpFileSystemOptions{
+			McpDescriptors: []*agentv1.McpDescriptor{{
+				ServerIdentifier: "user-fast-context",
+				ServerName:       "fast-context",
+				Tools:            []*agentv1.McpToolDescriptor{{ToolName: "fast_context_search"}},
+			}},
+		},
+	})
+
+	service.updateStreamMCPToolServers(stream, &agentv1.RequestContext{
+		McpFileSystemOptions: &agentv1.McpFileSystemOptions{},
+	})
+
+	if server := lookupMCPToolServer(stream, "fast_context_search"); server != "" {
+		t.Fatalf("MCP tool server after explicit empty snapshot = %q, want empty", server)
+	}
+}
 func TestMCPRegistryResolvesServerNameAlias(t *testing.T) {
 	stream := &ActiveStream{}
 	service := &Service{}
