@@ -37,6 +37,8 @@ const (
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
 
+	executePlanDirective = "Execute the current plan now. Start implementing it immediately instead of discussing or revising the plan."
+
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
 
@@ -767,7 +769,15 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	updateStreamRequestContextData(stream, intent.RequestContext)
 	hydrateStreamMCPToolServers(stream, conversation.MCPToolServers)
 	service.updateStreamMCPToolServers(stream, intent.RequestContext)
-	clearPendingProviderCompletion(stream)
+	streamMCPToolServers := snapshotStreamMCPToolServers(stream)
+	if _, err := service.store.UpdateConversationMeta(intent.ConversationID, func(conversation *ConversationFile) error {
+		if conversation != nil {
+			conversation.MCPToolServers = streamMCPToolServers
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	stream.mu.Lock()
 	stream.ThinkingEffort = strings.TrimSpace(intent.ThinkingEffort)
 	stream.SubagentModelOverrides = cloneSubagentModelOverrides(intent.SubagentModelOverrides)
@@ -2763,6 +2773,8 @@ func extractUserMessage(message *agentv1.AgentClientMessage) *agentv1.UserMessag
 		return item.UserMessageAction.GetUserMessage()
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
 	default:
 		return nil
 	}
@@ -2878,6 +2890,8 @@ func extractConversationActionUserMessage(action *agentv1.ConversationAction) *a
 		return item.UserMessageAction.GetUserMessage()
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
 	default:
 		return nil
 	}
@@ -3504,60 +3518,33 @@ func recentlyCompletedExecExists(stream *ActiveStream, messageID uint32) bool {
 }
 
 func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, requestContext *agentv1.RequestContext) {
+	if stream == nil {
+		return
+	}
 	servers := collectMCPToolServers(requestContext)
-	if stream == nil || len(servers) == 0 {
-		return
-	}
-	hydrateStreamMCPToolServers(stream, servers)
-
-	if service == nil || service.store == nil {
-		return
-	}
 	stream.mu.Lock()
-	conversationID := strings.TrimSpace(stream.ConversationID)
-	stream.mu.Unlock()
-	if conversationID == "" {
-		return
-	}
-	_, _ = service.store.UpdateConversationMeta(conversationID, func(conversation *ConversationFile) error {
-		if conversation == nil {
-			return nil
-		}
-		conversation.MCPToolServers = mergeMCPToolServerRegistry(conversation.MCPToolServers, servers)
-		return nil
-	})
-}
-
-func hydrateStreamMCPToolServers(stream *ActiveStream, servers map[string]string) {
-	if stream == nil || len(servers) == 0 {
-		return
-	}
-	stream.mu.Lock()
-	stream.MCPToolServers = mergeMCPToolServerRegistry(stream.MCPToolServers, servers)
+	stream.MCPToolServers = cloneStringMap(servers)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 }
 
-func mergeMCPToolServerRegistry(existing map[string]string, additions map[string]string) map[string]string {
-	merged := make(map[string]string, len(existing)+len(additions))
-	for toolName, serverIdentifier := range existing {
-		if toolName = strings.TrimSpace(toolName); toolName != "" {
-			if serverIdentifier = strings.TrimSpace(serverIdentifier); serverIdentifier != "" {
-				merged[toolName] = serverIdentifier
-			}
-		}
-	}
-	for toolName, serverIdentifier := range additions {
-		if toolName = strings.TrimSpace(toolName); toolName != "" {
-			if serverIdentifier = strings.TrimSpace(serverIdentifier); serverIdentifier != "" {
-				merged[toolName] = serverIdentifier
-			}
-		}
-	}
-	if len(merged) == 0 {
+func snapshotStreamMCPToolServers(stream *ActiveStream) map[string]string {
+	if stream == nil {
 		return nil
 	}
-	return merged
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return cloneStringMap(stream.MCPToolServers)
+}
+
+func hydrateStreamMCPToolServers(stream *ActiveStream, servers map[string]string) {
+	if stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	stream.MCPToolServers = cloneStringMap(servers)
+	stream.UpdatedAt = time.Now().UTC()
+	stream.mu.Unlock()
 }
 
 func (service *Service) rewriteDirectMCPToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) runtimecore.ToolInvocation {
@@ -3620,6 +3607,9 @@ func (service *Service) normalizeCallMCPToolInvocation(stream *ActiveStream, inv
 	}
 
 	if serverIdentifier != "" {
+		if resolvedServer := lookupMCPToolServer(stream, serverIdentifier); resolvedServer != "" {
+			serverIdentifier = resolvedServer
+		}
 		if resolvedServer := lookupMCPToolServer(stream, forwarderCanonicalMCPToolLookupName(serverIdentifier, toolName)); resolvedServer != "" {
 			serverIdentifier = resolvedServer
 		}

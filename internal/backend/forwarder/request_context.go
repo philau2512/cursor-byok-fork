@@ -318,8 +318,7 @@ func collectMCPToolServers(requestContext *agentv1.RequestContext) map[string]st
 	}
 
 	servers := make(map[string]string)
-	bareOwners := make(map[string]string)
-	ambiguousBareNames := make(map[string]struct{})
+	serverAliases := make(map[string]string)
 	addDescriptors := func(descriptors []*agentv1.McpDescriptor) {
 		for _, descriptor := range descriptors {
 			if descriptor == nil {
@@ -330,6 +329,10 @@ func collectMCPToolServers(requestContext *agentv1.RequestContext) map[string]st
 			if serverIdentifier == "" {
 				continue
 			}
+			if serverName != "" {
+				serverAliases[serverName] = serverIdentifier
+			}
+			serverAliases[serverIdentifier] = serverIdentifier
 			for _, tool := range descriptor.GetTools() {
 				if tool == nil {
 					continue
@@ -338,25 +341,19 @@ func collectMCPToolServers(requestContext *agentv1.RequestContext) map[string]st
 				if toolName == "" {
 					continue
 				}
-				servers[forwarderCanonicalMCPToolLookupName(serverIdentifier, toolName)] = serverIdentifier
-				if serverName != "" && serverName != serverIdentifier {
+				servers[toolName] = serverIdentifier
+				if serverName != "" {
 					servers[forwarderCanonicalMCPToolLookupName(serverName, toolName)] = serverIdentifier
 				}
-				if owner, exists := bareOwners[toolName]; !exists {
-					bareOwners[toolName] = serverIdentifier
-				} else if owner != serverIdentifier {
-					ambiguousBareNames[toolName] = struct{}{}
-				}
+				servers[forwarderCanonicalMCPToolLookupName(serverIdentifier, toolName)] = serverIdentifier
 			}
 		}
 	}
 
 	addDescriptors(requestContext.GetMcpFileSystemOptions().GetMcpDescriptors())
 	addDescriptors(requestContext.GetMcpMetaToolOptions().GetMcpDescriptors())
-	for toolName, serverIdentifier := range bareOwners {
-		if _, ambiguous := ambiguousBareNames[toolName]; !ambiguous {
-			servers[toolName] = serverIdentifier
-		}
+	for alias, identifier := range serverAliases {
+		servers[alias] = identifier
 	}
 	if len(servers) == 0 {
 		return nil
