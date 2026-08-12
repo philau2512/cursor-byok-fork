@@ -1570,9 +1570,6 @@ func (service *Service) buildCompactionSummaryMessages(plan *PendingCompaction) 
 	if systemText == "" {
 		return nil, fmt.Errorf("compaction prompt asset is empty")
 	}
-	if policy := service.resolveLanguagePolicy(plan.CurrentUserText); policy.Language != "" {
-		systemText = strings.TrimSpace(systemText + "\n\nProduce the summary in " + languageDisplayName(policy.Language) + ".")
-	}
 	sections := make([]string, 0, len(plan.CompactedTurns)+4)
 	if strings.TrimSpace(plan.ExistingSummary) != "" {
 		sections = append(sections, "Existing summary:\n"+strings.TrimSpace(plan.ExistingSummary))
