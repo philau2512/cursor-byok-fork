@@ -59,16 +59,23 @@ type usageFileDaily struct {
 }
 
 type usageFileEvent struct {
-	EventID          string    `json:"event_id"`
-	Kind             string    `json:"kind,omitempty"`
-	Status           string    `json:"status,omitempty"`
-	At               time.Time `json:"at"`
-	InputTokens      int64     `json:"input_tokens"`
-	OutputTokens     int64     `json:"output_tokens"`
-	CacheReadTokens  int64     `json:"cache_read_tokens"`
-	CacheWriteTokens int64     `json:"cache_write_tokens"`
-	TotalTokens      int64     `json:"total_tokens"`
-	UsagePresent     bool      `json:"usage_present"`
+	EventID                 string    `json:"event_id"`
+	Kind                    string    `json:"kind,omitempty"`
+	Status                  string    `json:"status,omitempty"`
+	At                      time.Time `json:"at"`
+	InputTokens             int64     `json:"input_tokens"`
+	OutputTokens            int64     `json:"output_tokens"`
+	CacheReadTokens         int64     `json:"cache_read_tokens"`
+	CacheWriteTokens        int64     `json:"cache_write_tokens"`
+	TotalTokens             int64     `json:"total_tokens"`
+	UsagePresent            bool      `json:"usage_present"`
+	ProviderPass            int       `json:"provider_pass,omitempty"`
+	CompileDurationMS       int64     `json:"compile_duration_ms,omitempty"`
+	EstimatedPromptTokens   int64     `json:"estimated_prompt_tokens,omitempty"`
+	ReplayMessageCount      int       `json:"replay_message_count,omitempty"`
+	TTFTMS                  int64     `json:"ttft_ms,omitempty"`
+	DurationMS              int64     `json:"duration_ms,omitempty"`
+	CacheReadUsageAvailable bool      `json:"cache_read_usage_available,omitempty"`
 }
 
 type usageFileDelta struct {
@@ -171,6 +178,21 @@ func (store *UsageFileStore) LookupEvent(needle string) (usageFileEvent, bool, e
 		}
 		if event.At.After(aggregate.At) {
 			aggregate.At = event.At
+			aggregate.ProviderPass = event.ProviderPass
+			aggregate.CompileDurationMS = event.CompileDurationMS
+			aggregate.EstimatedPromptTokens = event.EstimatedPromptTokens
+			aggregate.ReplayMessageCount = event.ReplayMessageCount
+			aggregate.TTFTMS = event.TTFTMS
+			aggregate.DurationMS = event.DurationMS
+			aggregate.CacheReadUsageAvailable = event.CacheReadUsageAvailable
+		} else if aggregate.At.Equal(event.At) {
+			aggregate.ProviderPass = event.ProviderPass
+			aggregate.CompileDurationMS = event.CompileDurationMS
+			aggregate.EstimatedPromptTokens = event.EstimatedPromptTokens
+			aggregate.ReplayMessageCount = event.ReplayMessageCount
+			aggregate.TTFTMS = event.TTFTMS
+			aggregate.DurationMS = event.DurationMS
+			aggregate.CacheReadUsageAvailable = event.CacheReadUsageAvailable
 		}
 		aggregate.InputTokens += nonNegativeInt64(event.InputTokens)
 		aggregate.OutputTokens += nonNegativeInt64(event.OutputTokens)

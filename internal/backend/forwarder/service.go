@@ -1513,7 +1513,12 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
+	compileStartedAt := time.Now().UTC()
 	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
+	compileDurationMS := time.Since(compileStartedAt).Milliseconds()
+	if compileDurationMS < 0 {
+		compileDurationMS = 0
+	}
 	if err != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
@@ -1552,11 +1557,19 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	maxTokens, requestKnobs := service.resolveProviderOutputBudget(modelID, conversation, compiled)
+	estimatedPromptTokens := readInt64Value(requestKnobs["compiled_prompt_tokens_estimate"])
 	service.maybeSaveLastAgentModelHash(conversation, modelID, mode, currentPass)
 	ctx, cancel := context.WithCancel(context.Background())
 	stream.mu.Lock()
 	stream.ProviderActive = true
 	stream.ProviderCancel = cancel
+	stream.ProviderUsage = turnUsageSnapshot{
+		ProviderPass:          currentPass,
+		CompileDurationMS:     compileDurationMS,
+		EstimatedPromptTokens: estimatedPromptTokens,
+		ReplayMessageCount:    len(compiled.Messages) - 1,
+		RequestPreparedAt:     time.Now().UTC(),
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseProviderRunning)

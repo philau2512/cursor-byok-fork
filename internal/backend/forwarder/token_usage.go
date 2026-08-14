@@ -13,15 +13,21 @@ import (
 )
 
 type turnUsageSnapshot struct {
-	Provider          string
-	Model             string
-	InputTokens       int64
-	OutputTokens      int64
-	CacheReadTokens   int64
-	CacheWriteTokens  int64
-	UsagePresent      bool
-	CacheReadPresent  bool
-	CacheWritePresent bool
+	Provider              string
+	Model                 string
+	InputTokens           int64
+	OutputTokens          int64
+	CacheReadTokens       int64
+	CacheWriteTokens      int64
+	UsagePresent          bool
+	CacheReadPresent      bool
+	CacheWritePresent     bool
+	ProviderPass          int
+	CompileDurationMS     int64
+	EstimatedPromptTokens int64
+	ReplayMessageCount    int
+	RequestPreparedAt     time.Time
+	FirstEventAt          time.Time
 }
 
 func (snapshot turnUsageSnapshot) hasAny() bool {
@@ -332,6 +338,14 @@ func (service *Service) recordTurnUsageSnapshot(stream *ActiveStream, conversati
 		}
 		stream.mu.Unlock()
 	}
+	requestPreparedAt := usage.RequestPreparedAt
+	firstEventAt := usage.FirstEventAt
+	if requestPreparedAt.IsZero() {
+		requestPreparedAt = startedAt
+	}
+	if firstEventAt.IsZero() {
+		firstEventAt = lastEventAt
+	}
 	if strings.TrimSpace(modelName) == "" {
 		modelName = modelID
 	}
@@ -342,14 +356,21 @@ func (service *Service) recordTurnUsageSnapshot(stream *ActiveStream, conversati
 	effectiveModelCallID := firstNonEmpty(strings.TrimSpace(modelCallID), strings.TrimSpace(requestID))
 	if service.usageStore != nil {
 		if err := service.usageStore.UpsertEvent(usageFileEvent{
-			EventID:          usageEventID(requestID, effectiveModelCallID),
-			Kind:             usageEventKindProvider,
-			At:               lastEventAt,
-			InputTokens:      usage.InputTokens,
-			OutputTokens:     usage.OutputTokens,
-			CacheReadTokens:  usage.CacheReadTokens,
-			CacheWriteTokens: usage.CacheWriteTokens,
-			UsagePresent:     usage.UsagePresent,
+			EventID:                 usageEventID(requestID, effectiveModelCallID),
+			Kind:                    usageEventKindProvider,
+			At:                      lastEventAt,
+			InputTokens:             usage.InputTokens,
+			OutputTokens:            usage.OutputTokens,
+			CacheReadTokens:         usage.CacheReadTokens,
+			CacheWriteTokens:        usage.CacheWriteTokens,
+			UsagePresent:            usage.UsagePresent,
+			ProviderPass:            usage.ProviderPass,
+			CompileDurationMS:       usage.CompileDurationMS,
+			EstimatedPromptTokens:   usage.EstimatedPromptTokens,
+			ReplayMessageCount:      usage.ReplayMessageCount,
+			TTFTMS:                  durationMilliseconds(requestPreparedAt, firstEventAt),
+			DurationMS:              durationMilliseconds(requestPreparedAt, lastEventAt),
+			CacheReadUsageAvailable: usage.CacheReadPresent,
 		}); err != nil {
 			return err
 		}
@@ -360,13 +381,22 @@ func (service *Service) recordTurnUsageSnapshot(stream *ActiveStream, conversati
 				return nil
 			}
 			item.LastProviderCall = &ConversationProviderCall{
-				RequestID:   strings.TrimSpace(requestID),
-				ModelCallID: effectiveModelCallID,
-				Provider:    provider,
-				Model:       modelName,
-				Status:      strings.TrimSpace(status),
-				ErrorText:   strings.TrimSpace(errorText),
-				UpdatedAt:   lastEventAt,
+				RequestID:               strings.TrimSpace(requestID),
+				ModelCallID:             effectiveModelCallID,
+				Provider:                provider,
+				Model:                   modelName,
+				ProviderPass:            usage.ProviderPass,
+				CompileDurationMS:       nonNegativeInt64(usage.CompileDurationMS),
+				EstimatedPromptTokens:   nonNegativeInt64(usage.EstimatedPromptTokens),
+				ReplayMessageCount:      usage.ReplayMessageCount,
+				TTFTMS:                  durationMilliseconds(requestPreparedAt, firstEventAt),
+				DurationMS:              durationMilliseconds(requestPreparedAt, lastEventAt),
+				CacheReadTokens:         nonNegativeInt64(usage.CacheReadTokens),
+				CacheReadUsageAvailable: usage.CacheReadPresent,
+				FirstEventAt:            firstEventAt,
+				Status:                  strings.TrimSpace(status),
+				ErrorText:               strings.TrimSpace(errorText),
+				UpdatedAt:               lastEventAt,
 			}
 			return nil
 		})
@@ -377,6 +407,17 @@ func (service *Service) recordTurnUsageSnapshot(stream *ActiveStream, conversati
 	_ = turnSeq
 	_ = startedAt
 	return nil
+}
+
+func durationMilliseconds(startedAt time.Time, finishedAt time.Time) int64 {
+	if startedAt.IsZero() || finishedAt.IsZero() {
+		return 0
+	}
+	value := finishedAt.Sub(startedAt).Milliseconds()
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 func (service *Service) recordTurnFinalizedSnapshot(stream *ActiveStream, conversationID string, turnSeq int64, requestID string, status string, errorText string) error {

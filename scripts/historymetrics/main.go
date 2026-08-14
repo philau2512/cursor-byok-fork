@@ -36,6 +36,21 @@ func main() {
 	fmt.Printf("- Cache write tokens: %s\n", formatNumber(summary.CacheWriteTokens))
 	fmt.Printf("- Prompt tokens total: %s\n", formatNumber(summary.PromptTokensTotal))
 	fmt.Printf("- Request tokens total: %s\n", formatNumber(summary.RequestTokensTotal))
+	for _, metric := range summary.ProviderPassMetrics {
+		fmt.Println("\nProvider pass")
+		fmt.Printf("- Request / model call: %s / %s\n", metric.RequestID, metric.ModelCallID)
+		fmt.Printf("- Provider pass: %s\n", formatNumber(int64(metric.ProviderPass)))
+		fmt.Printf("- Compile duration: %s ms\n", formatNumber(metric.CompileDurationMS))
+		fmt.Printf("- Estimated prompt tokens: %s\n", formatNumber(metric.EstimatedPromptTokens))
+		fmt.Printf("- Replay messages: %s\n", formatNumber(int64(metric.ReplayMessageCount)))
+		fmt.Printf("- TTFT: %s ms\n", formatNumber(metric.TTFTMS))
+		fmt.Printf("- Provider duration: %s ms\n", formatNumber(metric.DurationMS))
+		if metric.CacheReadUsageAvailable {
+			fmt.Printf("- Cache read tokens: %s\n", formatNumber(metric.CacheReadTokens))
+		} else {
+			fmt.Println("- Cache read tokens: unavailable")
+		}
+	}
 }
 
 func exitf(message string) {
