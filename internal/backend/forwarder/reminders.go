@@ -60,18 +60,18 @@ func (injector *DefaultReminderInjector) Inject(mode agentv1.AgentMode, conversa
 		reminders = append(reminders, "You are in plan mode. Prioritize investigation, decomposition, tradeoff analysis, and a concrete plan; planning is the default workflow, not a read-only permission boundary.")
 		reminders = append(reminders, "When the user explicitly requests a planning artifact in the workspace—such as a file, directory, command, workflow, configuration, or documentation update—you may make the minimal requested change. Do not implement unrelated product behavior.")
 		reminders = append(reminders, "Use CreatePlan only when the user asks to save or update the plan in the plan UI. A textual plan is sufficient otherwise.")
-		reminders = append(reminders, "For plan-mode work, investigate directly by default, including difficult uncertainty and review. Do not launch exactly one Task worker as a substitute for the main agent. Treat Subagents as a constrained context and cost budget: use them only when at least two substantial, independent tracks have a clear parallel benefit, use the minimum count (normally two, at most three unless the user requests broader parallelism), and do not repeat overlapping investigations after sufficient evidence exists. Give each worker a non-overlapping scope and file ownership. Keep architecture decisions, synthesis, and the final plan with the main agent, and default to readonly investigation unless exclusive file ownership makes edits safe.")
+		reminders = append(reminders, "For plan-mode work, investigate directly by default, including difficult uncertainty and review. Use a single Task worker when it isolates a large investigation, log analysis, diff review, or codebase exploration; continues an already-context-heavy task; or completes a bounded subtask with a clear output and integration boundary. Use multiple workers only when at least two substantial, independent tracks have a clear parallel benefit, normally two and at most three unless the user requests broader parallelism. Do not repeat overlapping investigations after sufficient evidence exists or allow concurrent edits to the same file. Keep architecture decisions, synthesis, and the final plan with the main agent.")
 		reminders = append(reminders, "For narrow, well-scoped tasks, investigate directly and provide only the essential stages, tradeoffs, and next steps.")
 		if hasCurrentPlan(conversation) {
 			reminders = append(reminders, "A current plan already exists. Treat short follow-up requests as modifications to that current plan unless the user explicitly asks for a separate new plan. If updating the plan UI, call CreatePlan with the complete revised plan and omit name. The CreatePlan name field is only allowed on the first call.")
 		}
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		reminders = append(reminders, "You are in multitask mode. Act as a coordinator: for most non-trivial requests, delegate one coherent worker task with Task instead of doing the same investigation or implementation in the foreground.")
-		reminders = append(reminders, "After delegating the only coherent worker task for a request, do not continue the same work in the foreground. Only do distinct coordination work, answer a new independent question, or synthesize after multiple workers return.")
+		reminders = append(reminders, "You are in multitask mode. Act as a coordinator. Delegate a coherent worker task when context isolation, asynchronous duration, or a bounded ownership area gives a concrete benefit; handle trivial or tightly coupled work directly.")
+		reminders = append(reminders, "After delegating, do not duplicate that worker's scope in the foreground. You may continue distinct coordination, integration preparation, an independent check, or a new user question while it runs.")
 		reminders = append(reminders, "Do not wait, sleep, or poll just for a running worker to complete. End the response unless there is separate useful coordination to do.")
 		reminders = append(reminders, "Do not over-decompose small or medium tasks into many sibling workers. Use multiple sibling workers only for clearly independent top-level workstreams.")
 	default:
-		reminders = append(reminders, "You are in agent mode with full available tool access. Handle work directly by default. Use Task only when at least two substantial, independent tracks have a clear parallel benefit; treat Subagents as a constrained context and cost budget, use the minimum count (normally two, at most three unless the user requests broader parallelism), and do not repeat overlapping investigations after sufficient evidence exists. Create or update a plan directly when that improves the task; switch to Plan mode only when its investigation-first workflow is materially useful.")
+		reminders = append(reminders, "You are in agent mode with full available tool access. Handle work directly by default. Use a single Task worker when a large investigation, log analysis, diff review, codebase exploration, bounded implementation, validation subtask, or follow-up benefits from context isolation or retained worker context. Use multiple workers only when at least two substantial, independent tracks have a clear parallel benefit; use the minimum count (normally two, at most three unless the user requests broader parallelism), avoid overlapping work, and retain architecture, integration, and final validation ownership. Create or update a plan directly when that improves the task; switch to Plan mode only when its investigation-first workflow is materially useful.")
 		reminders = append(reminders, "When reporting progress or completion, lead with the result, mention only key changes or verification, and avoid long recaps, exhaustive lists, or unsolicited example code.")
 	}
 
@@ -175,15 +175,15 @@ func newPromptContextReminder(source string, content string) PromptContextMessag
 
 func subagentContractText() string {
 	return strings.Join([]string{
-		"The turn that contains this reminder runs inside a subagent child conversation. Work as an investigator for the parent agent, not as the final user-facing assistant.",
-		"Return a short textual result: lead with the conclusion, keep only the key evidence, and do not produce a long response.",
+		"The turn that contains this reminder runs inside a subagent child conversation. Complete the parent-assigned, bounded investigation, implementation, or validation task; do not act as the final user-facing assistant.",
+		"Return a short textual handoff: lead with the conclusion, retain only key evidence, and state changed files, validation, or remaining integration work when applicable.",
 		"Use the available agent tools when they materially improve correctness or efficiency. Do not ask the user questions. If required information is missing, report the gap to the parent agent instead of asking the user directly.",
 	}, "\n\n")
 }
 
 func currentModeContractText(mode agentv1.AgentMode, childSubagent bool) string {
 	if childSubagent {
-		return "For the turn that contains this reminder, the active mode is a subagent child conversation. Use the available agent tools, but do not call AskQuestion. Return only a concise investigation result for the parent agent."
+		return "For the turn that contains this reminder, the active mode is a subagent child conversation. Complete the parent-assigned bounded task with the available agent tools, but do not call AskQuestion. Return a concise handoff with evidence, changes and validation when applicable, and any remaining parent integration work."
 	}
 	switch normalizeMode(mode) {
 	case agentv1.AgentMode_AGENT_MODE_PLAN:
@@ -191,9 +191,9 @@ func currentModeContractText(mode agentv1.AgentMode, childSubagent bool) string 
 	case agentv1.AgentMode_AGENT_MODE_ASK:
 		return "For the turn that contains this reminder, the active mode is ask. Prefer a direct answer. Use tools only when they materially improve accuracy, and do not call CreatePlan."
 	case agentv1.AgentMode_AGENT_MODE_DEBUG:
-		return "For the turn that contains this reminder, the active mode is debug. Follow the Debug Mode workflow from the static debug prompt: inspect or reproduce before editing, keep 3-5 concrete hypotheses, use the injected debug session log path when temporary instrumentation is useful, and verify with runtime evidence. Do not call CreatePlan or SwitchMode."
+		return "For the turn that contains this reminder, the active mode is debug. Follow the Debug Mode workflow from the static debug prompt: inspect or reproduce before editing; when the root cause is unresolved, keep 3-5 concrete hypotheses and use the injected debug session log path for instrumentation; verify with runtime evidence. Do not call CreatePlan or SwitchMode."
 	case agentv1.AgentMode_AGENT_MODE_MULTITASK:
-		return "For the turn that contains this reminder, the active mode is multitask. Act as the foreground coordinator: delegate most non-trivial work to a coherent worker with Task, avoid duplicating delegated work in the foreground, and do not wait just for a worker to finish."
+		return "For the turn that contains this reminder, the active mode is multitask. Act as the foreground coordinator: delegate when context isolation, asynchronous duration, or a bounded ownership area provides a concrete benefit; do not duplicate delegated scope, but continue distinct coordination, integration preparation, independent checks, or new user questions without waiting solely for a worker."
 	default:
 		return "For the turn that contains this reminder, the active mode is agent. Agent mode has full available tool access, including CreatePlan. You may create or revise a textual plan or a plan-UI artifact without switching modes. Switch to Plan mode only when investigation, design alternatives, or user collaboration needs its planning workflow; otherwise continue directly with the requested work."
 	}
