@@ -513,6 +513,11 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 	turnSeq := stream.TurnSeq
 	modelCallID := stream.CurrentModelCallID
 	stream.mu.Unlock()
+	stream.mu.Lock()
+	if stream.ProviderUsage.FirstEventAt.IsZero() {
+		stream.ProviderUsage.FirstEventAt = firstNonZeroTime(event.OccurredAt, time.Now().UTC())
+	}
+	stream.mu.Unlock()
 
 	switch event.Kind {
 	case modeladapter.ModelEventKindTextDelta:
@@ -630,18 +635,18 @@ func (service *Service) applyProviderModelEvent(stream *ActiveStream, event mode
 		return service.handleToolInvocation(stream, invocation)
 	case modeladapter.ModelEventKindTurnFinished:
 		stream.mu.Lock()
+		usage := stream.ProviderUsage
+		usage.Provider = event.Provider
+		usage.Model = event.Model
+		usage.InputTokens = event.InputTokens
+		usage.OutputTokens = event.OutputTokens
+		usage.CacheReadTokens = event.CacheReadTokens
+		usage.CacheWriteTokens = event.CacheWriteTokens
+		usage.UsagePresent = event.UsagePresent
+		usage.CacheReadPresent = event.CacheReadPresent
+		usage.CacheWritePresent = event.CacheWritePresent
 		stream.ProviderFinishReason = strings.TrimSpace(event.FinishReason)
-		stream.ProviderUsage = turnUsageSnapshot{
-			Provider:          event.Provider,
-			Model:             event.Model,
-			InputTokens:       event.InputTokens,
-			OutputTokens:      event.OutputTokens,
-			CacheReadTokens:   event.CacheReadTokens,
-			CacheWriteTokens:  event.CacheWriteTokens,
-			UsagePresent:      event.UsagePresent,
-			CacheReadPresent:  event.CacheReadPresent,
-			CacheWritePresent: event.CacheWritePresent,
-		}
+		stream.ProviderUsage = usage
 		stream.UpdatedAt = time.Now().UTC()
 		stream.mu.Unlock()
 		return nil

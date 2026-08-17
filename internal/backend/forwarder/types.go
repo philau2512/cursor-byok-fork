@@ -68,13 +68,22 @@ type ConversationRequestPrefix struct {
 }
 
 type ConversationProviderCall struct {
-	RequestID   string    `json:"request_id,omitempty"`
-	ModelCallID string    `json:"model_call_id,omitempty"`
-	Provider    string    `json:"provider,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	Status      string    `json:"status,omitempty"`
-	ErrorText   string    `json:"error_text,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+	RequestID               string    `json:"request_id,omitempty"`
+	ModelCallID             string    `json:"model_call_id,omitempty"`
+	Provider                string    `json:"provider,omitempty"`
+	Model                   string    `json:"model,omitempty"`
+	ProviderPass            int       `json:"provider_pass,omitempty"`
+	CompileDurationMS       int64     `json:"compile_duration_ms,omitempty"`
+	EstimatedPromptTokens   int64     `json:"estimated_prompt_tokens,omitempty"`
+	ReplayMessageCount      int       `json:"replay_message_count,omitempty"`
+	TTFTMS                  int64     `json:"ttft_ms,omitempty"`
+	DurationMS              int64     `json:"duration_ms,omitempty"`
+	CacheReadTokens         int64     `json:"cache_read_tokens,omitempty"`
+	CacheReadUsageAvailable bool      `json:"cache_read_usage_available,omitempty"`
+	FirstEventAt            time.Time `json:"first_event_at,omitempty"`
+	Status                  string    `json:"status,omitempty"`
+	ErrorText               string    `json:"error_text,omitempty"`
+	UpdatedAt               time.Time `json:"updated_at,omitempty"`
 }
 
 type HistoryEntry struct {

@@ -38,7 +38,8 @@ type Host struct {
 
 	lastRunErr error
 
-	mux http.Handler
+	mux             http.Handler
+	forwarderModule *forwarder.Module
 }
 
 func NewHost(store *serverconfig.Store, controlPlaneAuth upstream.AuthorizationProvider) (*Host, error) {
@@ -180,13 +181,20 @@ func (host *Host) Stop(ctx context.Context) error {
 	}
 	host.runMu.Lock()
 	serverInstance := host.httpServer
+	forwarderModule := host.forwarderModule
 	host.httpServer = nil
+	host.forwarderModule = nil
 	host.runMu.Unlock()
 	if serverInstance == nil {
 		return nil
 	}
-	err := serverInstance.Shutdown(ctx)
-	return err
+	if err := serverInstance.Shutdown(ctx); err != nil {
+		return err
+	}
+	if forwarderModule != nil && forwarderModule.Service != nil {
+		return forwarderModule.Service.Close(ctx)
+	}
+	return nil
 }
 
 func (host *Host) HealthCheck(ctx context.Context) error {
@@ -269,7 +277,16 @@ func (host *Host) rebuild(cfg serverconfig.Config) error {
 
 func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 	host.listenAddr = cfg.BackendListenAddr
+	previousModule := host.forwarderModule
 	agentModule := forwarder.NewModule(appdata.HistoryRootPath(), host.configs)
+	host.forwarderModule = agentModule
+	if previousModule != nil && previousModule.Service != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := previousModule.Service.Close(closeCtx); err != nil {
+			logger.Errorf("关闭旧 forwarder usage writer 失败: %v", err)
+		}
+	}
 	legacyBidiAppendProcedure := "/aiserver.v1.BidiService/BidiAppend"
 	legacyRunSSEProcedure := "/agent.v1.AgentService/RunSSE"
 	routeDeps := upstream.Dependencies{

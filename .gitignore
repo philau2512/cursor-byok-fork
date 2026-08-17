@@ -3,6 +3,7 @@ dist
 .task
 bin
 logs/
+plans/
 gen/
 logs.zip
 frontend/bindings

@@ -250,6 +250,7 @@ func subagentModelOverrideSummaries(overrides map[string]runtimecore.SubagentMod
 
 type Service struct {
 	store              *ConversationFileStore
+	contentBlobs       *ContentBlobStore
 	usageStore         *UsageFileStore
 	codebaseIndexStore *CodebaseIndexStore
 	docsIndexStore     *DocsIndexStore
@@ -276,6 +277,7 @@ type agentModelMemory interface {
 func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Service {
 	projector := NewHistoryProjector()
 	store := NewConversationFileStore(historyRoot)
+	contentBlobs := NewContentBlobStore(historyRoot)
 	broker := NewStreamBroker()
 	rules := NewUserRuleStore(appdata.RulesRootPath())
 	var modelMemory agentModelMemory
@@ -289,12 +291,13 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 	debug := newDebugRecorder(historyRoot, broker, debugConfig)
 	service := &Service{
 		store:              store,
+		contentBlobs:       contentBlobs,
 		usageStore:         NewUsageFileStore(historyRoot),
 		codebaseIndexStore: NewCodebaseIndexStore(appdata.CodebaseIndexRootPath()),
 		docsIndexStore:     NewDocsIndexStore(appdata.DocsIndexRootPath()),
 		rules:              rules,
 		projector:          projector,
-		compiler:           NewPromptCompiler(projector, NewToolCatalog(), NewReminderInjector(), rules),
+		compiler:           NewPromptCompiler(projector, NewToolCatalog(), NewReminderInjector(), rules, contentBlobs),
 		provider:           NewProviderGateway(resolver),
 		resolver:           resolver,
 		modelMemory:        modelMemory,
@@ -310,6 +313,14 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 	return service
 }
 
+// Close flushes telemetry that is intentionally persisted outside provider completion paths.
+func (service *Service) Close(ctx context.Context) error {
+	if service == nil || service.usageStore == nil {
+		return nil
+	}
+	return service.usageStore.Close(ctx)
+}
+
 // newServiceWithDependencies 主要用于测试场景，允许注入替身依赖。
 func newServiceWithDependencies(store *ConversationFileStore, projector *HistoryProjector, compiler PromptCompiler, provider ProviderGateway, broker *StreamBroker) *Service {
 	historyRoot := ""
@@ -319,6 +330,7 @@ func newServiceWithDependencies(store *ConversationFileStore, projector *History
 	debug := newDebugRecorder(historyRoot, broker, nil)
 	return &Service{
 		store:              store,
+		contentBlobs:       NewContentBlobStore(historyRoot),
 		rules:              NewUserRuleStore(appdata.RulesRootPath()),
 		projector:          projector,
 		compiler:           compiler,
@@ -1077,6 +1089,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	if !result.IsTerminal {
 		return nil
 	}
+	if err := service.persistExecContentBlobs(result.ContentBlobs); err != nil {
+		return err
+	}
 	markExecCompleted(stream, pending)
 	backgroundShellToolCallID := ""
 	if strings.TrimSpace(pending.ExecKind) == "shell" && shellToolCallIsBackgrounded(result.ToolCall) {
@@ -1113,6 +1128,21 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func (service *Service) persistExecContentBlobs(blobs []execbridge.ContentBlob) error {
+	if len(blobs) == 0 {
+		return nil
+	}
+	if service == nil || service.contentBlobs == nil {
+		return fmt.Errorf("content blob store is not initialized")
+	}
+	for _, blob := range blobs {
+		if err := service.contentBlobs.Put(blob.ID, blob.Data); err != nil {
+			return fmt.Errorf("persist exec content blob: %w", err)
+		}
+	}
+	return nil
 }
 
 // handleExecControl 处理执行桥控制面结果，例如 stream_close 或 throw。
@@ -1491,7 +1521,12 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
+	compileStartedAt := time.Now().UTC()
 	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
+	compileDurationMS := time.Since(compileStartedAt).Milliseconds()
+	if compileDurationMS < 0 {
+		compileDurationMS = 0
+	}
 	if err != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
@@ -1530,11 +1565,19 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	maxTokens, requestKnobs := service.resolveProviderOutputBudget(modelID, conversation, compiled)
+	estimatedPromptTokens := readInt64Value(requestKnobs["compiled_prompt_tokens_estimate"])
 	service.maybeSaveLastAgentModelHash(conversation, modelID, mode, currentPass)
 	ctx, cancel := context.WithCancel(context.Background())
 	stream.mu.Lock()
 	stream.ProviderActive = true
 	stream.ProviderCancel = cancel
+	stream.ProviderUsage = turnUsageSnapshot{
+		ProviderPass:          currentPass,
+		CompileDurationMS:     compileDurationMS,
+		EstimatedPromptTokens: estimatedPromptTokens,
+		ReplayMessageCount:    len(compiled.Messages) - 1,
+		RequestPreparedAt:     time.Now().UTC(),
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseProviderRunning)
@@ -3518,7 +3561,7 @@ func recentlyCompletedExecExists(stream *ActiveStream, messageID uint32) bool {
 }
 
 func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, requestContext *agentv1.RequestContext) {
-	if stream == nil {
+	if stream == nil || !hasMCPDescriptorSnapshot(requestContext) {
 		return
 	}
 	servers := collectMCPToolServers(requestContext)
@@ -3526,6 +3569,11 @@ func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, request
 	stream.MCPToolServers = cloneStringMap(servers)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+}
+
+func hasMCPDescriptorSnapshot(requestContext *agentv1.RequestContext) bool {
+	return requestContext != nil &&
+		(requestContext.GetMcpFileSystemOptions() != nil || requestContext.GetMcpMetaToolOptions() != nil)
 }
 
 func snapshotStreamMCPToolServers(stream *ActiveStream) map[string]string {
