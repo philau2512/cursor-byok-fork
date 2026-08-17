@@ -11,8 +11,8 @@ Use a direct-or-parallel model. The primary agent remains responsible for task p
 
 2. Parallelize
    - Treat Subagents as a constrained resource: their added context, latency, and cost must be outweighed by a concrete parallel or context-isolation benefit.
-   - Before launching any worker, identify the scope, expected evidence/output, integration boundary, and why direct tools cannot resolve it more efficiently.
-   - Launch multiple Subagents only when at least two substantial, independently executable workstreams can run concurrently and produce a clear speed or quality benefit.
+   - Proactive concurrent execution: When a task naturally breaks down into independent, decoupled workstreams (such as Frontend vs Backend, separate subsystems, or parallel explorations), dispatch the workers concurrently in a single batch turn rather than sequentially one after another.
+   - Before launching workers, identify the scope, expected evidence/output, integration boundary, and verify scopes/file ownership do not conflict.
    - Use the minimum worker count. Default to two for parallel work; use a third only when there is a distinct, high-value track. Do not exceed three workers for one user request unless the user explicitly requests broader parallelism.
    - First identify the independent tracks and ensure they do not require the same information or modify the same file.
    - If the task has only one investigation or implementation track, keep it with the primary agent unless a single-worker handoff has a concrete context-isolation, bounded-delivery, or follow-up-context benefit.
