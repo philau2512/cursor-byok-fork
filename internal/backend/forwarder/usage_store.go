@@ -1,12 +1,15 @@
 package forwarder
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +17,8 @@ const (
 	usageFileName          = "usage.json"
 	usageFileSchemaVersion = 2
 	usageRecentEventLimit  = 500
+	usageWriteDebounce     = 500 * time.Millisecond
+	usageWriteRetryDelay   = time.Second
 
 	usageEventKindProvider = "provider_call"
 	usageEventKindTurn     = "turn_finalized"
@@ -22,15 +27,27 @@ const (
 
 type UsageFileStore struct {
 	path string
+
+	mu         sync.RWMutex
+	document   usageFileDocument
+	eventIndex map[string]usageFileEvent
+	generation uint64
+	persisted  uint64
+	lastError  error
+
+	writeMu sync.Mutex
+	dirty   chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+	close   sync.Once
 }
 
 type usageFileDocument struct {
-	SchemaVersion int                       `json:"schema_version"`
-	UpdatedAt     time.Time                 `json:"updated_at"`
-	Totals        usageFileTotals           `json:"totals"`
-	Daily         []usageFileDaily          `json:"daily"`
-	RecentEvents  []usageFileEvent          `json:"recent_events"`
-	EventIndex    map[string]usageFileEvent `json:"event_index,omitempty"`
+	SchemaVersion int              `json:"schema_version"`
+	UpdatedAt     time.Time        `json:"updated_at"`
+	Totals        usageFileTotals  `json:"totals"`
+	Daily         []usageFileDaily `json:"daily"`
+	RecentEvents  []usageFileEvent `json:"recent_events"`
 }
 
 type usageFileTotals struct {
@@ -91,84 +108,68 @@ type usageFileDelta struct {
 }
 
 func NewUsageFileStore(historyRoot string) *UsageFileStore {
-	return &UsageFileStore{path: filepath.Join(strings.TrimSpace(historyRoot), usageFileName)}
+	store := &UsageFileStore{
+		path:       filepath.Join(strings.TrimSpace(historyRoot), usageFileName),
+		dirty:      make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		eventIndex: make(map[string]usageFileEvent),
+	}
+	store.document = newUsageFileDocument()
+	if strings.TrimSpace(store.path) != "" {
+		document, err := readUsageFileDocument(store.path)
+		if err != nil {
+			store.lastError = err
+			log.Printf("forwarder usage store load failed path=%s err=%v", store.path, err)
+		} else {
+			store.document = document
+			store.eventIndex = buildUsageEventIndex(document.RecentEvents)
+		}
+	}
+	go store.runWriter()
+	return store
 }
 
 func (store *UsageFileStore) UpsertEvent(event usageFileEvent) error {
 	if store == nil || strings.TrimSpace(store.path) == "" {
 		return nil
 	}
-	event.EventID = strings.TrimSpace(event.EventID)
+	event = normalizeUsageFileEvent(event)
 	if event.EventID == "" {
 		return nil
 	}
-	event.Kind = normalizeUsageEventKind(event.Kind)
-	event.Status = strings.TrimSpace(event.Status)
-	if event.At.IsZero() {
-		event.At = time.Now().UTC()
-	} else {
-		event.At = event.At.UTC()
-	}
-	event.InputTokens = nonNegativeInt64(event.InputTokens)
-	event.OutputTokens = nonNegativeInt64(event.OutputTokens)
-	event.CacheReadTokens = nonNegativeInt64(event.CacheReadTokens)
-	event.CacheWriteTokens = nonNegativeInt64(event.CacheWriteTokens)
-	event.TotalTokens = event.InputTokens + event.OutputTokens + event.CacheReadTokens + event.CacheWriteTokens
 
-	if err := os.MkdirAll(filepath.Dir(store.path), 0o755); err != nil {
-		return fmt.Errorf("create usage directory: %w", err)
-	}
-	release, err := acquireConversationLock(store.path + ".lock")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	doc, err := readUsageFileDocument(store.path)
-	if err != nil {
-		return err
-	}
-	if doc.EventIndex == nil {
-		doc.EventIndex = make(map[string]usageFileEvent)
-	}
-	oldEvent, found := doc.EventIndex[event.EventID]
+	store.mu.Lock()
+	oldEvent, found := store.eventIndex[event.EventID]
 	if found {
-		applyUsageFileDelta(&doc, oldEvent.At, negateUsageFileDelta(usageFileEventDelta(oldEvent)))
+		applyUsageFileDelta(&store.document, oldEvent.At, negateUsageFileDelta(usageFileEventDelta(oldEvent)))
 	}
-	applyUsageFileDelta(&doc, event.At, usageFileEventDelta(event))
-	doc.RecentEvents = upsertRecentUsageEvent(doc.RecentEvents, event)
-	doc.RecentEvents = trimRecentUsageEvents(doc.RecentEvents, usageRecentEventLimit)
-	doc.EventIndex = buildUsageEventIndex(doc.RecentEvents)
-	doc.SchemaVersion = usageFileSchemaVersion
-	doc.UpdatedAt = time.Now().UTC()
-	return writeJSONFileAtomic(store.path, doc)
+	applyUsageFileDelta(&store.document, event.At, usageFileEventDelta(event))
+	store.document.RecentEvents = upsertRecentUsageEvent(store.document.RecentEvents, event)
+	store.document.RecentEvents = trimRecentUsageEvents(store.document.RecentEvents, usageRecentEventLimit)
+	store.eventIndex = buildUsageEventIndex(store.document.RecentEvents)
+	store.document.SchemaVersion = usageFileSchemaVersion
+	store.document.UpdatedAt = time.Now().UTC()
+	store.generation++
+	store.mu.Unlock()
+	store.signalDirty()
+	return nil
 }
 
 func (store *UsageFileStore) LookupEvent(needle string) (usageFileEvent, bool, error) {
 	if store == nil || strings.TrimSpace(store.path) == "" {
 		return usageFileEvent{}, false, nil
 	}
-	doc, err := readUsageFileDocument(store.path)
-	if err != nil {
-		return usageFileEvent{}, false, err
-	}
 	trimmed := strings.TrimSpace(needle)
 	if trimmed == "" {
 		return usageFileEvent{}, false, nil
 	}
+
+	store.mu.RLock()
+	defer store.mu.RUnlock()
 	var aggregate usageFileEvent
 	found := false
-	events := doc.EventIndex
-	if len(events) == 0 {
-		events = make(map[string]usageFileEvent, len(doc.RecentEvents))
-		for _, event := range doc.RecentEvents {
-			if eventID := strings.TrimSpace(event.EventID); eventID != "" {
-				events[eventID] = event
-			}
-		}
-	}
-	for _, event := range events {
-		eventID := strings.TrimSpace(event.EventID)
+	for eventID, event := range store.eventIndex {
 		if eventID != trimmed && !strings.HasPrefix(eventID, trimmed+"::") {
 			continue
 		}
@@ -176,16 +177,8 @@ func (store *UsageFileStore) LookupEvent(needle string) (usageFileEvent, bool, e
 			aggregate = usageFileEvent{EventID: trimmed, At: event.At}
 			found = true
 		}
-		if event.At.After(aggregate.At) {
+		if event.At.After(aggregate.At) || event.At.Equal(aggregate.At) {
 			aggregate.At = event.At
-			aggregate.ProviderPass = event.ProviderPass
-			aggregate.CompileDurationMS = event.CompileDurationMS
-			aggregate.EstimatedPromptTokens = event.EstimatedPromptTokens
-			aggregate.ReplayMessageCount = event.ReplayMessageCount
-			aggregate.TTFTMS = event.TTFTMS
-			aggregate.DurationMS = event.DurationMS
-			aggregate.CacheReadUsageAvailable = event.CacheReadUsageAvailable
-		} else if aggregate.At.Equal(event.At) {
 			aggregate.ProviderPass = event.ProviderPass
 			aggregate.CompileDurationMS = event.CompileDurationMS
 			aggregate.EstimatedPromptTokens = event.EstimatedPromptTokens
@@ -201,22 +194,142 @@ func (store *UsageFileStore) LookupEvent(needle string) (usageFileEvent, bool, e
 		aggregate.TotalTokens += nonNegativeInt64(event.TotalTokens)
 		aggregate.UsagePresent = aggregate.UsagePresent || event.UsagePresent
 	}
-	if found {
-		return aggregate, true, nil
+	return aggregate, found, nil
+}
+
+func (store *UsageFileStore) Flush(ctx context.Context) error {
+	if store == nil || strings.TrimSpace(store.path) == "" {
+		return nil
 	}
-	return usageFileEvent{}, false, nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.flushDirty()
+}
+
+func (store *UsageFileStore) Close(ctx context.Context) error {
+	if store == nil {
+		return nil
+	}
+	store.close.Do(func() { close(store.stop) })
+	select {
+	case <-store.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return store.Flush(ctx)
+}
+
+func (store *UsageFileStore) signalDirty() {
+	select {
+	case store.dirty <- struct{}{}:
+	default:
+	}
+}
+
+func (store *UsageFileStore) runWriter() {
+	defer close(store.done)
+	for {
+		select {
+		case <-store.stop:
+			if err := store.flushDirty(); err != nil {
+				log.Printf("forwarder usage store shutdown flush failed path=%s err=%v", store.path, err)
+			}
+			return
+		case <-store.dirty:
+		}
+
+		timer := time.NewTimer(usageWriteDebounce)
+		select {
+		case <-store.stop:
+			timer.Stop()
+			if err := store.flushDirty(); err != nil {
+				log.Printf("forwarder usage store shutdown flush failed path=%s err=%v", store.path, err)
+			}
+			return
+		case <-timer.C:
+		}
+		if err := store.flushDirty(); err != nil {
+			log.Printf("forwarder usage store flush failed path=%s err=%v", store.path, err)
+			timer := time.NewTimer(usageWriteRetryDelay)
+			select {
+			case <-store.stop:
+				timer.Stop()
+				if err := store.flushDirty(); err != nil {
+					log.Printf("forwarder usage store shutdown flush failed path=%s err=%v", store.path, err)
+				}
+				return
+			case <-timer.C:
+				store.signalDirty()
+			}
+		}
+	}
+}
+
+func (store *UsageFileStore) flushDirty() error {
+	store.writeMu.Lock()
+	defer store.writeMu.Unlock()
+
+	for {
+		store.mu.RLock()
+		if store.persisted == store.generation {
+			store.mu.RUnlock()
+			return nil
+		}
+		generation := store.generation
+		snapshot := cloneUsageFileDocument(store.document)
+		store.mu.RUnlock()
+
+		if err := writeUsageFileDocument(store.path, snapshot); err != nil {
+			store.mu.Lock()
+			store.lastError = err
+			store.mu.Unlock()
+			return err
+		}
+
+		store.mu.Lock()
+		store.lastError = nil
+		if generation > store.persisted {
+			store.persisted = generation
+		}
+		upToDate := store.persisted == store.generation
+		store.mu.Unlock()
+		if upToDate {
+			return nil
+		}
+	}
+}
+
+func newUsageFileDocument() usageFileDocument {
+	return usageFileDocument{
+		SchemaVersion: usageFileSchemaVersion,
+		Daily:         make([]usageFileDaily, 0),
+		RecentEvents:  make([]usageFileEvent, 0),
+	}
+}
+
+func normalizeUsageFileEvent(event usageFileEvent) usageFileEvent {
+	event.EventID = strings.TrimSpace(event.EventID)
+	event.Kind = normalizeUsageEventKind(event.Kind)
+	event.Status = strings.TrimSpace(event.Status)
+	if event.At.IsZero() {
+		event.At = time.Now().UTC()
+	} else {
+		event.At = event.At.UTC()
+	}
+	event.InputTokens = nonNegativeInt64(event.InputTokens)
+	event.OutputTokens = nonNegativeInt64(event.OutputTokens)
+	event.CacheReadTokens = nonNegativeInt64(event.CacheReadTokens)
+	event.CacheWriteTokens = nonNegativeInt64(event.CacheWriteTokens)
+	event.TotalTokens = event.InputTokens + event.OutputTokens + event.CacheReadTokens + event.CacheWriteTokens
+	return event
 }
 
 func readUsageFileDocument(path string) (usageFileDocument, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return usageFileDocument{
-				SchemaVersion: usageFileSchemaVersion,
-				Daily:         make([]usageFileDaily, 0),
-				RecentEvents:  make([]usageFileEvent, 0),
-				EventIndex:    make(map[string]usageFileEvent),
-			}, nil
+			return newUsageFileDocument(), nil
 		}
 		return usageFileDocument{}, fmt.Errorf("read usage file: %w", err)
 	}
@@ -228,10 +341,35 @@ func readUsageFileDocument(path string) (usageFileDocument, error) {
 		doc.SchemaVersion = 1
 	}
 	doc.RecentEvents = trimRecentUsageEvents(doc.RecentEvents, usageRecentEventLimit)
-	if len(doc.EventIndex) == 0 {
-		doc.EventIndex = buildUsageEventIndex(doc.RecentEvents)
+	for index := range doc.RecentEvents {
+		doc.RecentEvents[index] = normalizeUsageFileEvent(doc.RecentEvents[index])
+	}
+	if doc.Daily == nil {
+		doc.Daily = make([]usageFileDaily, 0)
+	}
+	if doc.RecentEvents == nil {
+		doc.RecentEvents = make([]usageFileEvent, 0)
 	}
 	return doc, nil
+}
+
+func writeUsageFileDocument(path string, document usageFileDocument) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create usage directory: %w", err)
+	}
+	release, err := acquireConversationLock(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+	return writeJSONFileAtomic(path, document)
+}
+
+func cloneUsageFileDocument(document usageFileDocument) usageFileDocument {
+	clone := document
+	clone.Daily = append([]usageFileDaily(nil), document.Daily...)
+	clone.RecentEvents = append([]usageFileEvent(nil), document.RecentEvents...)
+	return clone
 }
 
 func upsertRecentUsageEvent(items []usageFileEvent, event usageFileEvent) []usageFileEvent {

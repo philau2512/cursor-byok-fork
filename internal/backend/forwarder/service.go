@@ -313,6 +313,14 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 	return service
 }
 
+// Close flushes telemetry that is intentionally persisted outside provider completion paths.
+func (service *Service) Close(ctx context.Context) error {
+	if service == nil || service.usageStore == nil {
+		return nil
+	}
+	return service.usageStore.Close(ctx)
+}
+
 // newServiceWithDependencies 主要用于测试场景，允许注入替身依赖。
 func newServiceWithDependencies(store *ConversationFileStore, projector *HistoryProjector, compiler PromptCompiler, provider ProviderGateway, broker *StreamBroker) *Service {
 	historyRoot := ""
