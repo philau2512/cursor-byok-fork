@@ -1035,7 +1035,13 @@ func clearStreamTimer(stream *ActiveStream, key string) {
 		return
 	}
 	stream.mu.Lock()
-	delete(stream.TimerTokens, key)
+	if stream.TimerTokens == nil {
+		stream.TimerTokens = make(map[string]uint64)
+	}
+	stream.TimerTokens[key]++
+	if stream.TimerTokens[key] == 0 {
+		stream.TimerTokens[key]++
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 }

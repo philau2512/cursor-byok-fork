@@ -10,6 +10,47 @@ import (
 	modeladapter "cursor/internal/backend/agent/model"
 )
 
+func TestClearStreamTimerInvalidatesStaleTimerToken(t *testing.T) {
+	stream := &ActiveStream{TimerTokens: map[string]uint64{"checkpoint_blobs": 1}}
+	stale := &streamTimerEvent{Key: "checkpoint_blobs", Token: 1}
+
+	clearStreamTimer(stream, stale.Key)
+	if timerEventMatches(stream, stale) {
+		t.Fatal("cleared timer token still matches its stale event")
+	}
+
+	stream.mu.Lock()
+	currentToken := stream.TimerTokens[stale.Key]
+	stream.mu.Unlock()
+	if currentToken != 2 {
+		t.Fatalf("timer token after clear = %d, want 2", currentToken)
+	}
+
+	current := &streamTimerEvent{Key: stale.Key, Token: currentToken}
+	if !timerEventMatches(stream, current) {
+		t.Fatal("current timer token does not match")
+	}
+}
+
+func TestScheduleStreamTimerDoesNotReuseClearedToken(t *testing.T) {
+	stream := &ActiveStream{TimerTokens: map[string]uint64{"checkpoint_blobs": 1}}
+	clearStreamTimer(stream, "checkpoint_blobs")
+
+	stream.mu.Lock()
+	stream.TimerTokens["checkpoint_blobs"]++
+	rescheduledToken := stream.TimerTokens["checkpoint_blobs"]
+	stream.mu.Unlock()
+	if rescheduledToken != 3 {
+		t.Fatalf("rescheduled timer token = %d, want 3", rescheduledToken)
+	}
+	if timerEventMatches(stream, &streamTimerEvent{Key: "checkpoint_blobs", Token: 1}) {
+		t.Fatal("stale timer matches after a new timer was scheduled")
+	}
+	if !timerEventMatches(stream, &streamTimerEvent{Key: "checkpoint_blobs", Token: rescheduledToken}) {
+		t.Fatal("rescheduled timer does not match")
+	}
+}
+
 func TestTakeProviderOutputForToolConsumesReasoningOnce(t *testing.T) {
 	stream := &ActiveStream{
 		ProviderAccumulatedText:                     "I will inspect both files.",

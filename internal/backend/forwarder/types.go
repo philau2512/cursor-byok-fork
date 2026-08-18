@@ -177,9 +177,10 @@ type ActiveStream struct {
 	ProviderUsage                               turnUsageSnapshot
 	ProviderTerminalToolInvocation              bool
 	PendingCompaction                           *PendingCompaction
-	PendingCheckpointBlobWrites                 map[uint32]string
+	PendingCheckpointBlobWrites                 map[uint32]pendingCheckpointBlobWrite
 	ConfirmedCheckpointBlobs                    map[string]struct{}
 	NextCheckpointBlobRequestID                 uint32
+	CheckpointGeneration                        uint64
 	PendingCheckpoint                           *pendingCheckpointPublish
 
 	Backlog                     []StreamEvent
@@ -255,9 +256,13 @@ type checkpointTerminalAction struct {
 }
 
 type pendingCheckpointPublish struct {
-	State    *agentv1.ConversationStateStructure
-	Required map[string]struct{}
-	Terminal checkpointTerminalAction
+	Generation     uint64
+	QueuedAt       time.Time
+	TotalBlobBytes int
+	NewBlobCount   int
+	State          *agentv1.ConversationStateStructure
+	Required       map[string]struct{}
+	Terminal       checkpointTerminalAction
 }
 
 type PendingCompaction struct {
