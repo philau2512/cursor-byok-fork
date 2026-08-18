@@ -489,7 +489,7 @@ func (store *ConversationFileStore) writeContextLocked(conversationID string, co
 		UpdatedAt:      time.Now().UTC(),
 		Items:          append([]HistoryEntry(nil), conversation.Entries...),
 	}
-	return writeJSONFileAtomic(store.contextPath(conversationID), context)
+	return writeJSONFileAtomicCompact(store.contextPath(conversationID), context)
 }
 
 func conversationTranscriptSyncReady(conversation *ConversationFile) bool {
@@ -864,6 +864,14 @@ func validateConversationID(conversationID string) (string, error) {
 }
 
 func writeJSONFileAtomic(path string, payload any) error {
+	return writeJSONFileAtomicWithIndent(path, payload, true)
+}
+
+func writeJSONFileAtomicCompact(path string, payload any) error {
+	return writeJSONFileAtomicWithIndent(path, payload, false)
+}
+
+func writeJSONFileAtomicWithIndent(path string, payload any, indent bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create parent directory: %w", err)
 	}
@@ -871,9 +879,11 @@ func writeJSONFileAtomic(path string, payload any) error {
 	if err != nil {
 		return fmt.Errorf("marshal json: %w", err)
 	}
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, data, "", "  "); err == nil {
-		data = pretty.Bytes()
+	if indent {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, data, "", "  "); err == nil {
+			data = pretty.Bytes()
+		}
 	}
 	file, tempPath, err := openUniqueArtifactTempFile(path)
 	if err != nil {
