@@ -124,7 +124,7 @@ func TestCheckpointBlobTimeoutDoesNotFailSuccessfulTurn(t *testing.T) {
 	}
 }
 
-func TestCheckpointBlobSyncPublishesCheckpointBeforeFailedTerminal(t *testing.T) {
+func TestCheckpointBlobSyncPublishesFailedTerminalImmediately(t *testing.T) {
 	service, stream, _ := testCheckpointBlobProjection(t)
 	if err := service.failActiveStream(
 		stream,
@@ -137,56 +137,29 @@ func TestCheckpointBlobSyncPublishesCheckpointBeforeFailedTerminal(t *testing.T)
 		t.Fatalf("failActiveStream() error = %v", err)
 	}
 
-	for _, event := range readCheckpointTestEvents(t, service, stream) {
-		if event.Message.GetConversationCheckpointUpdate() != nil || event.End {
-			t.Fatalf("event before ACK = %#v, want only Blob writes", event)
-		}
-	}
-	stream.mu.Lock()
-	phaseBeforeACK := stream.Phase
-	statusBeforeACK := stream.Status
-	stream.mu.Unlock()
-	if phaseBeforeACK != TurnPhaseCheckpointing || isTerminalStreamStatus(statusBeforeACK) {
-		t.Fatalf("before ACK phase=%s status=%s, want checkpointing and non-terminal", phaseBeforeACK, statusBeforeACK)
-	}
-
-	acknowledgeCheckpointBlobs(t, service, stream)
 	events := readCheckpointTestEvents(t, service, stream)
-	checkpointIndex, endIndex := -1, -1
-	for index, event := range events {
-		switch {
-		case event.Message.GetConversationCheckpointUpdate() != nil:
-			checkpointIndex = index
-		case event.End:
-			endIndex = index
-			if event.TerminalErrorCode != "provider_error" || event.TerminalErrorMessage != "provider failed" {
-				t.Fatalf("terminal event = %#v, want provider error", event)
-			}
+	var failedEnd bool
+	for _, event := range events {
+		if event.End && event.TerminalErrorCode == "provider_error" && event.TerminalErrorMessage == "provider failed" {
+			failedEnd = true
 		}
 	}
-	if checkpointIndex < 0 || endIndex <= checkpointIndex {
-		t.Fatalf("terminal order checkpoint=%d end=%d", checkpointIndex, endIndex)
+	if !failedEnd {
+		t.Fatalf("events = %#v, want immediate failed terminal", events)
 	}
 	stream.mu.Lock()
-	phaseAfterACK := stream.Phase
-	statusAfterACK := stream.Status
+	phase := stream.Phase
+	status := stream.Status
 	stream.mu.Unlock()
-	if phaseAfterACK != TurnPhaseFailed || statusAfterACK != StreamStatusFailed {
-		t.Fatalf("after ACK phase=%s status=%s, want failed", phaseAfterACK, statusAfterACK)
+	if phase != TurnPhaseFailed || status != StreamStatusFailed {
+		t.Fatalf("phase=%s status=%s, want failed", phase, status)
 	}
 }
 
 func TestCheckpointBlobTimeoutStillPublishesFailedTerminal(t *testing.T) {
-	service, stream, _ := testCheckpointBlobProjection(t)
-	if err := service.failActiveStream(
-		stream,
-		stream.ConversationID,
-		stream.RequestID,
-		"model-call-1",
-		"provider_error",
-		"provider failed",
-	); err != nil {
-		t.Fatalf("failActiveStream() error = %v", err)
+	service, stream, projection := testCheckpointBlobProjection(t)
+	if err := service.queueCheckpointProjectionWithTerminal(stream, projection, failedCheckpointTerminalAction("provider_error", "provider failed")); err != nil {
+		t.Fatalf("queueCheckpointProjectionWithTerminal() error = %v", err)
 	}
 	if err := service.handleCheckpointBlobTimeout(stream); err != nil {
 		t.Fatalf("handleCheckpointBlobTimeout() error = %v", err)

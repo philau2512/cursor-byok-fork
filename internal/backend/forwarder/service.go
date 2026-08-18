@@ -2733,12 +2733,9 @@ func (service *Service) failActiveStream(stream *ActiveStream, conversationID st
 			err,
 		)
 	}
-	terminal := failedCheckpointTerminalAction(terminalCode, terminalMessage)
-	if err := service.publishCheckpointWithTerminalAction(requestID, terminal); err != nil {
-		log.Printf("forwarder checkpoint queue before failed terminal skipped request_id=%s err=%v", strings.TrimSpace(requestID), err)
-		return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
-	}
-	return nil
+	service.discardPendingCheckpoint(stream, "stream failed")
+	_ = service.publishCheckpoint(requestID, conversationID)
+	return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
 }
 
 // buildRunEntries 构造一次 run intent 需要写入 history 的首批 entry。
