@@ -6,6 +6,54 @@ import (
 	"cursor/gen/agentv1"
 )
 
+func TestStreamBrokerRoutesOnlyOneActiveStream(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request-1", "conversation-1", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "hello")
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	resolved, ok := broker.SingleActiveStream()
+	if !ok || resolved != stream {
+		t.Fatalf("SingleActiveStream() = (%p, %t), want (%p, true)", resolved, ok, stream)
+	}
+
+	if _, err := broker.OpenStream("request-2", "conversation-2", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "hello"); err != nil {
+		t.Fatalf("OpenStream(second) error = %v", err)
+	}
+	if resolved, ok := broker.SingleActiveStream(); ok || resolved != nil {
+		t.Fatalf("SingleActiveStream() with multiple streams = (%p, %t), want (nil, false)", resolved, ok)
+	}
+}
+
+func TestDecodeConversationActionRoutesQueuedMessageToSingleActiveStream(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("active-request", "conversation-1", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "running")
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	service := &Service{broker: broker}
+	message := &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_ConversationAction{
+			ConversationAction: &agentv1.ConversationAction{
+				Action: &agentv1.ConversationAction_UserMessageAction{
+					UserMessageAction: &agentv1.UserMessageAction{UserMessage: &agentv1.UserMessage{Text: "queued message"}},
+				},
+			},
+		},
+	}
+
+	intent, err := service.decodeInboundIntent("queued-request", message, "conversation_action")
+	if err != nil {
+		t.Fatalf("decodeInboundIntent() error = %v", err)
+	}
+	if intent.Kind != "run" || intent.ConversationID != stream.ConversationID {
+		t.Fatalf("intent = %#v, want queued run for %q", intent, stream.ConversationID)
+	}
+	if intent.ModelID != stream.ModelID || intent.ModelName != stream.ModelName {
+		t.Fatalf("intent model = (%q, %q), want (%q, %q)", intent.ModelID, intent.ModelName, stream.ModelID, stream.ModelName)
+	}
+}
+
 func TestStreamBrokerTerminalOperationsAreIdempotent(t *testing.T) {
 	testCases := []struct {
 		name       string

@@ -59,6 +59,13 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		existing.ModelName = strings.TrimSpace(modelName)
 		existing.Mode = normalizedMode
 		existing.LatestUserText = strings.TrimSpace(latestUserText)
+		existing.Backlog = make([]StreamEvent, 0, 64)
+		existing.BacklogBaseCursor = 0
+		for _, sub := range existing.Subscribers {
+			if sub != nil {
+				sub.Cursor = 0
+			}
+		}
 		if existing.Status == "" {
 			existing.Status = StreamStatusCreated
 		}
@@ -136,6 +143,39 @@ func (broker *StreamBroker) Get(requestID string) (*ActiveStream, bool) {
 	defer broker.mu.RUnlock()
 	stream, ok := broker.streams[strings.TrimSpace(requestID)]
 	return stream, ok
+}
+
+// SingleActiveStream returns the only non-terminal stream when the client omitted
+// its conversation context. It deliberately refuses ambiguous routing.
+func (broker *StreamBroker) SingleActiveStream() (*ActiveStream, bool) {
+	if broker == nil {
+		return nil, false
+	}
+	broker.mu.RLock()
+	candidates := make([]*ActiveStream, 0, 1)
+	for _, stream := range broker.streams {
+		if stream != nil {
+			candidates = append(candidates, stream)
+		}
+	}
+	broker.mu.RUnlock()
+
+	var active *ActiveStream
+	for _, stream := range candidates {
+		stream.mu.Lock()
+		conversationID := strings.TrimSpace(stream.ConversationID)
+		status := stream.Status
+		phase := stream.Phase
+		stream.mu.Unlock()
+		if conversationID == "" || isTerminalStreamStatus(status) || phase == TurnPhaseCanceled || phase == TurnPhaseCompleted || phase == TurnPhaseFailed {
+			continue
+		}
+		if active != nil {
+			return nil, false
+		}
+		active = stream
+	}
+	return active, active != nil
 }
 
 // Subscribe 为指定 request 注册一个新订阅者，并返回用于唤醒 backlog 消费的信号通道。

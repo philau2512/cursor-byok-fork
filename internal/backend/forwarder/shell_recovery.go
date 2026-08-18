@@ -10,7 +10,7 @@ import (
 )
 
 const shellTerminalRecoveryGrace = 1500 * time.Millisecond
-const shellDispatchRecoveryTimeout = 5 * time.Second
+const shellDispatchRecoveryTimeout = 30 * time.Second
 
 const (
 	shellRecoveryReasonDispatchDeadline   = "dispatch_deadline_exceeded"
@@ -196,6 +196,9 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	if stream == nil {
 		return nil
 	}
+	if reason == shellRecoveryReasonDispatchDeadline {
+		return service.failUnacknowledgedShellDispatch(stream, pending)
+	}
 	pending.ShellRecoveryScheduled = true
 	markExecCompleted(stream, pending)
 	resultPayload := buildSyntheticShellResultPayload(pending, reason)
@@ -243,6 +246,36 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func (service *Service) failUnacknowledgedShellDispatch(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	pending.ShellRecoveryScheduled = true
+	markExecCompleted(stream, pending)
+	message := fmt.Sprintf("shell dispatch was not acknowledged by the Cursor client within %dms", shellDispatchRecoveryTimeout.Milliseconds())
+	log.Printf(
+		"forwarder shell dispatch unacknowledged request_id=%s tool_call_id=%s message_id=%d exec_id=%s stream_state=%s",
+		strings.TrimSpace(stream.RequestID),
+		strings.TrimSpace(pending.ToolCallID),
+		pending.MessageID,
+		strings.TrimSpace(pending.ExecID),
+		strings.TrimSpace(pending.StreamState),
+	)
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "dispatch_unacknowledged", map[string]any{
+			"tool_call_id":        pending.ToolCallID,
+			"message_id":          pending.MessageID,
+			"exec_id":             pending.ExecID,
+			"exec_kind":           pending.ExecKind,
+			"approval_state":      pending.ShellApprovalState,
+			"recent_stream_state": pending.StreamState,
+			"timeout_ms":          shellDispatchRecoveryTimeout.Milliseconds(),
+			"error":               message,
+		}),
+	}); err != nil {
+		return err
+	}
+	service.setTurnPhase(stream, TurnPhaseFailed)
+	return service.failStream(stream, "shell_dispatch_unacknowledged", fmt.Errorf("%s", message))
 }
 
 func buildSyntheticShellResultPayload(pending runtimecore.PendingExec, reason string) string {

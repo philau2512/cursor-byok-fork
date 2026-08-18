@@ -318,7 +318,7 @@ func shouldStopStreamActor(stream *ActiveStream) bool {
 func (service *Service) handleStreamCommand(stream *ActiveStream, command streamCommand) error {
 	switch command.Kind {
 	case streamCommandRun:
-		return service.handleRunIntent(command.Intent)
+		return service.executeSerializedRun(command.Intent)
 	case streamCommandCancel:
 		return service.handleCancelIntent(command.Intent)
 	case streamCommandMetadata:

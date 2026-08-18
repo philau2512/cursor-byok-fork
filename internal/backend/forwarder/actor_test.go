@@ -223,6 +223,72 @@ func TestCompletedEditHistoryRetainsBoundedVisibleDiff(t *testing.T) {
 	}
 }
 
+func TestSupersededSameRequestInvalidatesPreviousProviderEvents(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request-1", "conversation-1", 4, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "old run")
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	stream.mu.Lock()
+	stream.ProviderActive = true
+	stream.CurrentProviderToken = 7
+	stream.Phase = TurnPhaseWaitingExternal
+	stream.mu.Unlock()
+	service := &Service{broker: broker}
+	service.supersedeActiveRunWithSameRequest(InboundIntent{RequestID: stream.RequestID, ConversationID: stream.ConversationID}, 5)
+
+	stream.mu.Lock()
+	currentToken := stream.CurrentProviderToken
+	providerActive := stream.ProviderActive
+	stream.mu.Unlock()
+	if currentToken != 8 || providerActive {
+		t.Fatalf("superseded stream state = token:%d active:%t, want token:8 active:false", currentToken, providerActive)
+	}
+	if err := service.handleProviderEvent(stream, &streamProviderEvent{
+		Token: 7,
+		Event: modeladapter.ModelEvent{Kind: modeladapter.ModelEventKindTextDelta, Text: "stale output"},
+	}); err != nil {
+		t.Fatalf("handleProviderEvent(stale) error = %v", err)
+	}
+	events, err := broker.ReadFromCursor(stream.RequestID, 0)
+	if err != nil {
+		t.Fatalf("ReadFromCursor() error = %v", err)
+	}
+	for _, event := range events {
+		if event.Message != nil && event.Message.GetInteractionUpdate().GetTextDelta().GetText() == "stale output" {
+			t.Fatal("stale provider output was published")
+		}
+	}
+}
+
+func TestStaleProviderTextDeltaIsIgnoredAfterTokenAdvance(t *testing.T) {
+	broker := NewStreamBroker()
+	stream, err := broker.OpenStream("request-1", "conversation-1", 1, "model", "model", agentv1.AgentMode_AGENT_MODE_AGENT, "old run")
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	stream.mu.Lock()
+	stream.CurrentProviderToken = 7
+	stream.mu.Unlock()
+	service := &Service{broker: broker}
+
+	if err := service.handleProviderEvent(stream, &streamProviderEvent{
+		Token: 6,
+		Event: modeladapter.ModelEvent{Kind: modeladapter.ModelEventKindTextDelta, Text: "stale output"},
+	}); err != nil {
+		t.Fatalf("handleProviderEvent(stale) error = %v", err)
+	}
+	events, err := broker.ReadFromCursor(stream.RequestID, 0)
+	if err != nil {
+		t.Fatalf("ReadFromCursor() error = %v", err)
+	}
+	for _, event := range events {
+		if event.Message != nil && event.Message.GetInteractionUpdate().GetTextDelta().GetText() == "stale output" {
+			t.Fatal("stale provider output was published")
+		}
+	}
+}
+
 func actorTestEditToolCall(t *testing.T, path string) []byte {
 	t.Helper()
 	payload, err := protojson.Marshal(&agentv1.ToolCall{

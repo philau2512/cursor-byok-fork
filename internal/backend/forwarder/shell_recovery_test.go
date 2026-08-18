@@ -46,7 +46,7 @@ func TestInitializeRunningShellStartsForegroundDeadline(t *testing.T) {
 	}
 }
 
-func TestShellDispatchRecoveryCompletesWhenClientNeverAcknowledgesExecution(t *testing.T) {
+func TestShellDispatchRecoveryFailsTransportWithoutCompletingTool(t *testing.T) {
 	service, stream, pending := testShellRecoveryFixture(t, "opened")
 	if pending.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
 		t.Fatalf("shell approval state = %q, want %q", pending.ShellApprovalState, runtimecore.ShellApprovalStateAwaiting)
@@ -58,11 +58,17 @@ func TestShellDispatchRecoveryCompletesWhenClientNeverAcknowledgesExecution(t *t
 	if _, found := snapshotPendingExec(stream, pending.ExecID); found {
 		t.Fatal("dispatch recovery left an unacknowledged shell pending")
 	}
-	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 1 {
-		t.Fatalf("dispatch recovery completion count = %d, want 1", completions)
+	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 0 {
+		t.Fatalf("dispatch recovery completion count = %d, want 0", completions)
 	}
-	if !shellHistoryContains(stream, "shell-incomplete") {
-		t.Fatal("dispatch recovery did not persist an incomplete shell result")
+	if !shellHistoryContains(stream, "dispatch_unacknowledged") {
+		t.Fatal("dispatch recovery did not persist unacknowledged-dispatch telemetry")
+	}
+	stream.mu.Lock()
+	status := stream.Status
+	stream.mu.Unlock()
+	if status != StreamStatusFailed {
+		t.Fatalf("stream status = %q, want %q", status, StreamStatusFailed)
 	}
 }
 
@@ -83,7 +89,9 @@ func TestShellDispatchRecoveryIsCanceledByClientAcknowledgement(t *testing.T) {
 		t.Fatalf("shell start error = %v", err)
 	}
 
-	time.Sleep(shellDispatchRecoveryTimeout + 250*time.Millisecond)
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonDispatchDeadline); err != nil {
+		t.Fatalf("dispatch recovery after acknowledgement error = %v", err)
+	}
 	if _, found := snapshotPendingExec(stream, pending.ExecID); !found {
 		t.Fatal("dispatch timer recovered an acknowledged shell")
 	}
