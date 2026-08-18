@@ -46,6 +46,52 @@ func TestInitializeRunningShellStartsForegroundDeadline(t *testing.T) {
 	}
 }
 
+func TestShellDispatchRecoveryCompletesWhenClientNeverAcknowledgesExecution(t *testing.T) {
+	service, stream, pending := testShellRecoveryFixture(t, "opened")
+	if pending.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
+		t.Fatalf("shell approval state = %q, want %q", pending.ShellApprovalState, runtimecore.ShellApprovalStateAwaiting)
+	}
+
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonDispatchDeadline); err != nil {
+		t.Fatalf("dispatch recovery error = %v", err)
+	}
+	if _, found := snapshotPendingExec(stream, pending.ExecID); found {
+		t.Fatal("dispatch recovery left an unacknowledged shell pending")
+	}
+	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 1 {
+		t.Fatalf("dispatch recovery completion count = %d, want 1", completions)
+	}
+	if !shellHistoryContains(stream, "shell-incomplete") {
+		t.Fatal("dispatch recovery did not persist an incomplete shell result")
+	}
+}
+
+func TestShellDispatchRecoveryIsCanceledByClientAcknowledgement(t *testing.T) {
+	service, stream, pending := testShellRecoveryFixture(t, "opened")
+	service.scheduleShellDispatchRecovery(stream.RequestID, pending)
+
+	start := &agentv1.ExecClientMessage{
+		Id:     pending.MessageID,
+		ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_ShellStream{
+			ShellStream: &agentv1.ShellStream{
+				Event: &agentv1.ShellStream_Start{Start: &agentv1.ShellStreamStart{}},
+			},
+		},
+	}
+	if err := service.handleExecResult(InboundIntent{RequestID: stream.RequestID, ExecClientMessage: start}); err != nil {
+		t.Fatalf("shell start error = %v", err)
+	}
+
+	time.Sleep(shellDispatchRecoveryTimeout + 250*time.Millisecond)
+	if _, found := snapshotPendingExec(stream, pending.ExecID); !found {
+		t.Fatal("dispatch timer recovered an acknowledged shell")
+	}
+	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 0 {
+		t.Fatalf("acknowledged shell completion count = %d, want 0", completions)
+	}
+}
+
 func TestShellForegroundRecoveryDoesNotCloseWhileAwaitingApproval(t *testing.T) {
 	service, stream, pending := testShellRecoveryFixture(t, "opened")
 	pending.ShellApprovalState = runtimecore.ShellApprovalStateAwaiting

@@ -10,8 +10,10 @@ import (
 )
 
 const shellTerminalRecoveryGrace = 1500 * time.Millisecond
+const shellDispatchRecoveryTimeout = 5 * time.Second
 
 const (
+	shellRecoveryReasonDispatchDeadline   = "dispatch_deadline_exceeded"
 	shellRecoveryReasonForegroundDeadline = "foreground_deadline_exceeded"
 	shellRecoveryReasonTransportClosed    = "transport_closed_without_terminal"
 )
@@ -71,6 +73,25 @@ func shellForegroundTimeoutDuration(argsJSON []byte) time.Duration {
 
 func shellForegroundTimeoutMS(argsJSON []byte) int64 {
 	return shellForegroundTimeoutDuration(argsJSON).Milliseconds()
+}
+
+func (service *Service) scheduleShellDispatchRecovery(requestID string, pending runtimecore.PendingExec) {
+	if service == nil || strings.TrimSpace(requestID) == "" || strings.TrimSpace(pending.ExecKind) != "shell" || strings.TrimSpace(pending.ExecID) == "" || pending.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
+		return
+	}
+	stream, ok := service.broker.Get(requestID)
+	if !ok || stream == nil {
+		return
+	}
+	service.scheduleStreamTimer(
+		stream,
+		providerTimerKey(streamTimerShellDispatch, pending.ExecID),
+		shellDispatchRecoveryTimeout,
+		streamTimerShellDispatch,
+		pending.ExecID,
+		pending.MessageID,
+		shellRecoveryReasonDispatchDeadline,
+	)
 }
 
 func (service *Service) scheduleShellForegroundRecovery(requestID string, pending runtimecore.PendingExec) {
@@ -155,11 +176,14 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 	if !found || current.MessageID != messageID || strings.TrimSpace(current.ExecKind) != "shell" || isTerminalStreamStatus(status) {
 		return nil
 	}
-	if current.ShellApprovalState != runtimecore.ShellApprovalStateRunning {
+	if reason != shellRecoveryReasonDispatchDeadline && current.ShellApprovalState != runtimecore.ShellApprovalStateRunning {
 		return nil
 	}
 	switch strings.TrimSpace(current.StreamState) {
 	case "exited", "backgrounded", "rejected", "permission_denied":
+		return nil
+	}
+	if reason == shellRecoveryReasonDispatchDeadline && current.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
 		return nil
 	}
 	if reason == shellRecoveryReasonForegroundDeadline && !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
@@ -233,6 +257,8 @@ func buildSyntheticShellResultPayload(pending runtimecore.PendingExec, reason st
 	switch strings.TrimSpace(reason) {
 	case shellRecoveryReasonTransportClosed:
 		noteLines = append(noteLines, "The shell transport closed before a terminal event arrived.")
+	case shellRecoveryReasonDispatchDeadline:
+		noteLines = append(noteLines, fmt.Sprintf("The client did not acknowledge the shell dispatch within %dms.", shellDispatchRecoveryTimeout.Milliseconds()))
 	case shellRecoveryReasonForegroundDeadline:
 		noteLines = append(noteLines, fmt.Sprintf("The foreground wait window expired after %dms without a terminal event.", shellForegroundTimeoutMS(pending.ArgsJSON)))
 	default:

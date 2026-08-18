@@ -1058,6 +1058,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 		return fmt.Errorf("pending exec not found")
 	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
+	}
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
@@ -1167,6 +1170,9 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	pending = service.applyExecControlProgress(stream, pending, intent.ExecClientControlMessage)
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecControl(stream, pending, intent.ExecClientControlMessage)
+	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
 	}
 	if isHiddenWriteExecKind(pending.ExecKind) {
 		return service.handleHiddenWriteExecControl(stream, pending, intent.ExecClientControlMessage)
@@ -1966,6 +1972,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
+		service.scheduleShellDispatchRecovery(stream.RequestID, pendingExec)
 		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
 		removePendingExec := func() {
 			stream.mu.Lock()
