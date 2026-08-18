@@ -29,6 +29,62 @@ const (
 //go:embed common_prefix.md ask/prompt.md ask/tools.json plan/prompt.md plan/system_reminder.txt plan/tools.json agent/prompt.md agent/tools.json debug/prompt.md debug/tools.json debug/system_reminder_initial.txt debug/system_reminder_continuing.txt multitask/prompt.md multitask/tools.json subagent/prompt.md subagent/tools.json compaction/prompt.md commit/prompt.md
 var assetFS embed.FS
 
+var (
+	cachedPrompts = make(map[Mode]string)
+	cachedTools   = make(map[Mode][]byte)
+	cachedDebugInitialReminder    string
+	cachedDebugContinuingReminder string
+	cachedPlanReminder            string
+	cachedCompactionPrompt        string
+	cachedCommitPrompt            string
+)
+
+func init() {
+	for _, mode := range []Mode{ModeAsk, ModePlan, ModeAgent, ModeDebug, ModeMultitask, ModeSubagent} {
+		path := fmt.Sprintf("%s/prompt.md", mode)
+		if mode == ModeSubagent || mode == ModeDebug {
+			data, err := assetFS.ReadFile(path)
+			if err != nil {
+				panic(fmt.Errorf("cache prompt %q: %w", path, err))
+			}
+			cachedPrompts[mode] = string(data)
+		} else {
+			prefix, err := assetFS.ReadFile("common_prefix.md")
+			if err != nil {
+				panic(fmt.Errorf("cache common prefix: %w", err))
+			}
+			data, err := assetFS.ReadFile(path)
+			if err != nil {
+				panic(fmt.Errorf("cache prompt %q: %w", path, err))
+			}
+			cachedPrompts[mode] = string(prefix) + "\n\n" + string(data)
+		}
+
+		toolPath := fmt.Sprintf("%s/tools.json", mode)
+		toolData, err := assetFS.ReadFile(toolPath)
+		if err != nil {
+			panic(fmt.Errorf("cache tools %q: %w", toolPath, err))
+		}
+		cachedTools[mode] = toolData
+	}
+
+	if data, err := assetFS.ReadFile("debug/system_reminder_initial.txt"); err == nil {
+		cachedDebugInitialReminder = strings.TrimSpace(string(data))
+	}
+	if data, err := assetFS.ReadFile("debug/system_reminder_continuing.txt"); err == nil {
+		cachedDebugContinuingReminder = strings.TrimSpace(string(data))
+	}
+	if data, err := assetFS.ReadFile("plan/system_reminder.txt"); err == nil {
+		cachedPlanReminder = strings.TrimSpace(string(data))
+	}
+	if data, err := assetFS.ReadFile("compaction/prompt.md"); err == nil {
+		cachedCompactionPrompt = strings.TrimSpace(string(data))
+	}
+	if data, err := assetFS.ReadFile("commit/prompt.md"); err == nil {
+		cachedCommitPrompt = strings.TrimSpace(string(data))
+	}
+}
+
 // normalizeMode 校验并归一化传入的模式值。
 func normalizeMode(mode Mode) (Mode, error) {
 	switch mode {
@@ -63,6 +119,9 @@ func ReadPrompt(mode Mode) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if prompt, ok := cachedPrompts[normalized]; ok {
+		return prompt, nil
+	}
 	path := fmt.Sprintf("%s/prompt.md", normalized)
 	if normalized == ModeSubagent || normalized == ModeDebug {
 		data, err := assetFS.ReadFile(path)
@@ -93,6 +152,13 @@ func MustReadPrompt(mode Mode) string {
 
 // ReadTools 读取指定模式的原始工具 JSON。
 func ReadTools(mode Mode) ([]byte, error) {
+	normalized, err := normalizeMode(mode)
+	if err != nil {
+		return nil, err
+	}
+	if tools, ok := cachedTools[normalized]; ok {
+		return tools, nil
+	}
 	path, err := ToolsPath(mode)
 	if err != nil {
 		return nil, err
@@ -115,6 +181,12 @@ func MustReadTools(mode Mode) []byte {
 
 // ReadDebugSystemReminder 读取 Debug 模式每轮追加的提醒资产。
 func ReadDebugSystemReminder(initial bool) (string, error) {
+	if initial && cachedDebugInitialReminder != "" {
+		return cachedDebugInitialReminder, nil
+	}
+	if !initial && cachedDebugContinuingReminder != "" {
+		return cachedDebugContinuingReminder, nil
+	}
 	path := "debug/system_reminder_continuing.txt"
 	if initial {
 		path = "debug/system_reminder_initial.txt"
@@ -137,6 +209,9 @@ func MustReadDebugSystemReminder(initial bool) string {
 
 // ReadPlanSystemReminder 读取 Plan 模式每轮追加的动态提醒资产。
 func ReadPlanSystemReminder() (string, error) {
+	if cachedPlanReminder != "" {
+		return cachedPlanReminder, nil
+	}
 	const path = "plan/system_reminder.txt"
 	data, err := assetFS.ReadFile(path)
 	if err != nil {
@@ -156,6 +231,9 @@ func MustReadPlanSystemReminder() string {
 
 // ReadCompactionPrompt 读取共享的压缩提示词资产。
 func ReadCompactionPrompt() (string, error) {
+	if cachedCompactionPrompt != "" {
+		return cachedCompactionPrompt, nil
+	}
 	const path = "compaction/prompt.md"
 	data, err := assetFS.ReadFile(path)
 	if err != nil {
@@ -175,6 +253,9 @@ func MustReadCompactionPrompt() string {
 
 // ReadCommitPrompt 读取提交信息生成专用提示词资产。
 func ReadCommitPrompt() (string, error) {
+	if cachedCommitPrompt != "" {
+		return cachedCommitPrompt, nil
+	}
 	const path = "commit/prompt.md"
 	data, err := assetFS.ReadFile(path)
 	if err != nil {

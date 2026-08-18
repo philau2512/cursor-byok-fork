@@ -10,6 +10,47 @@ import (
 	promptassets "cursor/prompt"
 )
 
+type cachedToolCatalogEntry struct {
+	items []json.RawMessage
+	names []string
+}
+
+var (
+	cachedToolCatalogs = make(map[promptassets.Mode]cachedToolCatalogEntry)
+)
+
+func init() {
+	for _, mode := range []promptassets.Mode{
+		promptassets.ModeAsk,
+		promptassets.ModePlan,
+		promptassets.ModeAgent,
+		promptassets.ModeDebug,
+		promptassets.ModeMultitask,
+		promptassets.ModeSubagent,
+	} {
+		rawTools, err := promptassets.ReadTools(mode)
+		if err != nil {
+			continue
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(rawTools, &items); err != nil {
+			continue
+		}
+		names := make([]string, 0, len(items))
+		for _, item := range items {
+			name, err := extractToolName(item)
+			if err != nil {
+				continue
+			}
+			names = append(names, name)
+		}
+		cachedToolCatalogs[mode] = cachedToolCatalogEntry{
+			items: items,
+			names: names,
+		}
+	}
+}
+
 type DefaultToolCatalog struct {
 }
 
@@ -24,21 +65,30 @@ func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName
 	if err != nil {
 		return nil, nil, err
 	}
-	rawTools, err := promptassets.ReadTools(assetMode)
-	if err != nil {
-		return nil, nil, err
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(rawTools, &items); err != nil {
-		return nil, nil, fmt.Errorf("decode tools asset failed: %w", err)
-	}
-	filtered := make([]json.RawMessage, 0, len(items))
-	names := make([]string, 0, len(items))
-	for _, item := range items {
-		name, err := extractToolName(item)
+	cached, ok := cachedToolCatalogs[assetMode]
+	if !ok {
+		rawTools, err := promptassets.ReadTools(assetMode)
 		if err != nil {
 			return nil, nil, err
 		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(rawTools, &items); err != nil {
+			return nil, nil, fmt.Errorf("decode tools asset failed: %w", err)
+		}
+		cached = cachedToolCatalogEntry{items: items}
+		for _, item := range items {
+			name, err := extractToolName(item)
+			if err != nil {
+				return nil, nil, err
+			}
+			cached.names = append(cached.names, name)
+		}
+	}
+
+	filtered := make([]json.RawMessage, 0, len(cached.items))
+	names := make([]string, 0, len(cached.names))
+	for i, item := range cached.items {
+		name := cached.names[i]
 		if !isToolAllowedInMode(mode, subagentTypeName, name) {
 			continue
 		}

@@ -18,6 +18,65 @@ import (
 
 const todoSectionReminderMessage = "<system_reminder>\nYou are currently under the todo section, be sure to track tasks and do not forget to update.\n</system_reminder>"
 
+type cachedBaselineToolsEntry struct {
+	tools          []json.RawMessage
+	toolNames      []string
+	hiddenToolNames []string
+}
+
+var (
+	cachedBaselineTools = make(map[promptassets.Mode]cachedBaselineToolsEntry)
+	cachedSanitizedPrompts = make(map[promptassets.Mode]string)
+)
+
+func init() {
+	for _, mode := range []promptassets.Mode{
+		promptassets.ModeAsk,
+		promptassets.ModePlan,
+		promptassets.ModeAgent,
+		promptassets.ModeDebug,
+		promptassets.ModeMultitask,
+		promptassets.ModeSubagent,
+	} {
+		rawTools, err := promptassets.ReadTools(mode)
+		if err == nil {
+			var items []json.RawMessage
+			if err := json.Unmarshal(rawTools, &items); err == nil {
+				filtered := make([]json.RawMessage, 0, len(items))
+				names := make([]string, 0, len(items))
+				for _, item := range items {
+					name, err := extractToolName(item)
+					if err == nil {
+						filtered = append(filtered, item)
+						names = append(names, name)
+					}
+				}
+				cachedBaselineTools[mode] = cachedBaselineToolsEntry{
+					tools:          filtered,
+					toolNames:      names,
+					hiddenToolNames: nil,
+				}
+			}
+		}
+
+		promptText, err := promptassets.ReadPrompt(mode)
+		if err == nil {
+			lines := strings.Split(promptText, "\n")
+			filtered := make([]string, 0, len(lines))
+			for _, line := range lines {
+				trimmed := strings.TrimSpace(line)
+				switch trimmed {
+				case "# 通用系统提示词", "# 模式静态补充", "---":
+					continue
+				default:
+					filtered = append(filtered, line)
+				}
+			}
+			cachedSanitizedPrompts[mode] = strings.TrimSpace(strings.Join(filtered, "\n"))
+		}
+	}
+}
+
 // Message 表示内部统一的模型消息结构。
 type Message struct {
 	// Role 表示消息角色，例如 system、user、assistant。
@@ -119,22 +178,37 @@ func (engine *Engine) Compile(input CompileInput) (CompiledPrompt, error) {
 		return CompiledPrompt{}, err
 	}
 
-	promptText, err := promptassets.ReadPrompt(assetMode)
-	if err != nil {
-		return CompiledPrompt{}, err
-	}
-	rawTools, err := promptassets.ReadTools(assetMode)
-	if err != nil {
-		return CompiledPrompt{}, err
-	}
-
-	tools, toolNames, hiddenToolNames, err := decodeToolsFromBaseline(rawTools)
-	if err != nil {
-		return CompiledPrompt{}, err
+	var (
+		tools          []json.RawMessage
+		toolNames      []string
+		hiddenToolNames []string
+	)
+	if cached, ok := cachedBaselineTools[assetMode]; ok {
+		tools = cached.tools
+		toolNames = cached.toolNames
+		hiddenToolNames = cached.hiddenToolNames
+	} else {
+		rawTools, err := promptassets.ReadTools(assetMode)
+		if err != nil {
+			return CompiledPrompt{}, err
+		}
+		tools, toolNames, hiddenToolNames, err = decodeToolsFromBaseline(rawTools)
+		if err != nil {
+			return CompiledPrompt{}, err
+		}
 	}
 
 	messages := make([]Message, 0, 8)
-	systemPrompt := sanitizePromptAsset(promptText, input.RequestedModelName)
+	var systemPrompt string
+	if cached, ok := cachedSanitizedPrompts[assetMode]; ok {
+		systemPrompt = promptassets.RenderPromptTemplate(cached, input.RequestedModelName)
+	} else {
+		promptText, err := promptassets.ReadPrompt(assetMode)
+		if err != nil {
+			return CompiledPrompt{}, err
+		}
+		systemPrompt = sanitizePromptAsset(promptText, input.RequestedModelName)
+	}
 	if strings.TrimSpace(systemPrompt) != "" {
 		if strings.TrimSpace(input.CustomSystemPrompt) != "" {
 			systemPrompt = systemPrompt + "\n\n" + strings.TrimSpace(input.CustomSystemPrompt)
