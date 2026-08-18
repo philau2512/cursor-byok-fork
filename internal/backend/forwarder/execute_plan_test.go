@@ -44,3 +44,28 @@ func TestExtractUserMessage_ExecutePlanAction(t *testing.T) {
 		t.Fatalf("expected execution directive, got %q", userMessage.GetText())
 	}
 }
+
+func TestShouldIgnoreEmptyResumeRunRequestWhenConversationIsActive(t *testing.T) {
+	broker := NewStreamBroker()
+	service := &Service{broker: broker}
+	if _, err := broker.OpenStream(
+		"active-request", "conversation-1", 1, "default", "default",
+		agentv1.AgentMode_AGENT_MODE_AGENT, "working",
+	); err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+
+	conversationID := "conversation-1"
+	runRequest := &agentv1.AgentRunRequest{
+		ConversationId: &conversationID,
+		Action: &agentv1.ConversationAction{
+			Action: &agentv1.ConversationAction_ResumeAction{
+				ResumeAction: &agentv1.ResumeAction{},
+			},
+		},
+	}
+
+	if !service.shouldIgnoreEmptyResumeRunRequest("reconnect-request", runRequest, nil, nil) {
+		t.Fatal("expected payload-free resume to be ignored while its conversation is active")
+	}
+}

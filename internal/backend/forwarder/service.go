@@ -2854,8 +2854,14 @@ func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runR
 		return false
 	}
 	conversationID := strings.TrimSpace(runRequest.GetConversationId())
-	if conversationID == "" || service.hasActiveConversationStream(conversationID, requestID) {
+	if conversationID == "" {
 		return false
+	}
+	// A reconnect may issue a payload-free resume while the original turn is
+	// still active. It carries no work to resume, so accepting it would create
+	// a new run that immediately cancels the active one as "superseded".
+	if service.hasActiveConversationStream(conversationID, requestID) {
+		return true
 	}
 	conversation, err := service.loadConversationForResumeGuard(conversationID)
 	if err != nil || conversation == nil {
