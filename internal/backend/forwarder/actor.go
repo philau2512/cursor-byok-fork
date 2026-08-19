@@ -67,6 +67,7 @@ const (
 	streamTimerProviderResume       streamTimerKind = "provider_resume"
 	streamTimerNonStreamingRecovery streamTimerKind = "non_streaming_recovery"
 	streamTimerShellForeground      streamTimerKind = "shell_foreground"
+	streamTimerShellDispatch        streamTimerKind = "shell_dispatch"
 	streamTimerShellTransportClose  streamTimerKind = "shell_transport_close"
 	streamTimerCheckpointBlobs      streamTimerKind = "checkpoint_blobs"
 	streamTimerOrphanCancel         streamTimerKind = "orphan_cancel"
@@ -317,7 +318,7 @@ func shouldStopStreamActor(stream *ActiveStream) bool {
 func (service *Service) handleStreamCommand(stream *ActiveStream, command streamCommand) error {
 	switch command.Kind {
 	case streamCommandRun:
-		return service.handleRunIntent(command.Intent)
+		return service.executeSerializedRun(command.Intent)
 	case streamCommandCancel:
 		return service.handleCancelIntent(command.Intent)
 	case streamCommandMetadata:
@@ -1035,7 +1036,13 @@ func clearStreamTimer(stream *ActiveStream, key string) {
 		return
 	}
 	stream.mu.Lock()
-	delete(stream.TimerTokens, key)
+	if stream.TimerTokens == nil {
+		stream.TimerTokens = make(map[string]uint64)
+	}
+	stream.TimerTokens[key]++
+	if stream.TimerTokens[key] == 0 {
+		stream.TimerTokens[key]++
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 }
@@ -1066,6 +1073,8 @@ func (service *Service) handleTimerEvent(stream *ActiveStream, payload *streamTi
 			return nil
 		}
 		return service.recoverNonStreamingExecAfterStreamClose(stream, current)
+	case streamTimerShellDispatch:
+		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, shellRecoveryReasonDispatchDeadline)
 	case streamTimerShellForeground:
 		return service.recoverShellWithoutTerminalIfNeeded(stream, payload.ExecID, payload.MessageID, shellRecoveryReasonForegroundDeadline)
 	case streamTimerShellTransportClose:

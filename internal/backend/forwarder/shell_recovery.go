@@ -10,8 +10,11 @@ import (
 )
 
 const shellTerminalRecoveryGrace = 1500 * time.Millisecond
+const shellDispatchRecoveryTimeout = 30 * time.Second
+const shellRecentActivityGrace = 30 * time.Second
 
 const (
+	shellRecoveryReasonDispatchDeadline   = "dispatch_deadline_exceeded"
 	shellRecoveryReasonForegroundDeadline = "foreground_deadline_exceeded"
 	shellRecoveryReasonTransportClosed    = "transport_closed_without_terminal"
 )
@@ -71,6 +74,25 @@ func shellForegroundTimeoutDuration(argsJSON []byte) time.Duration {
 
 func shellForegroundTimeoutMS(argsJSON []byte) int64 {
 	return shellForegroundTimeoutDuration(argsJSON).Milliseconds()
+}
+
+func (service *Service) scheduleShellDispatchRecovery(requestID string, pending runtimecore.PendingExec) {
+	if service == nil || strings.TrimSpace(requestID) == "" || strings.TrimSpace(pending.ExecKind) != "shell" || strings.TrimSpace(pending.ExecID) == "" || pending.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
+		return
+	}
+	stream, ok := service.broker.Get(requestID)
+	if !ok || stream == nil {
+		return
+	}
+	service.scheduleStreamTimer(
+		stream,
+		providerTimerKey(streamTimerShellDispatch, pending.ExecID),
+		shellDispatchRecoveryTimeout,
+		streamTimerShellDispatch,
+		pending.ExecID,
+		pending.MessageID,
+		shellRecoveryReasonDispatchDeadline,
+	)
 }
 
 func (service *Service) scheduleShellForegroundRecovery(requestID string, pending runtimecore.PendingExec) {
@@ -155,22 +177,52 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 	if !found || current.MessageID != messageID || strings.TrimSpace(current.ExecKind) != "shell" || isTerminalStreamStatus(status) {
 		return nil
 	}
-	if current.ShellApprovalState != runtimecore.ShellApprovalStateRunning {
+	if reason != shellRecoveryReasonDispatchDeadline && current.ShellApprovalState != runtimecore.ShellApprovalStateRunning {
 		return nil
 	}
 	switch strings.TrimSpace(current.StreamState) {
 	case "exited", "backgrounded", "rejected", "permission_denied":
 		return nil
 	}
+	if reason == shellRecoveryReasonDispatchDeadline && current.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
+		return nil
+	}
 	if reason == shellRecoveryReasonForegroundDeadline && !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
 		return nil
 	}
+	if reason == shellRecoveryReasonForegroundDeadline {
+		now := time.Now().UTC()
+		if current.LastShellActivityAt.Add(shellRecentActivityGrace).After(now) {
+			return service.extendShellForegroundRecovery(stream, current, current.LastShellActivityAt.Add(shellRecentActivityGrace))
+		}
+	}
 	return service.recoverShellWithoutTerminal(stream, current, reason)
+}
+
+func (service *Service) extendShellForegroundRecovery(stream *ActiveStream, pending runtimecore.PendingExec, deadline time.Time) error {
+	if stream == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	if found {
+		current.ShellForegroundDeadline = deadline
+		stream.PendingExecs[pending.ExecID] = current
+		stream.UpdatedAt = time.Now().UTC()
+	}
+	stream.mu.Unlock()
+	if found {
+		service.scheduleShellForegroundRecovery(stream.RequestID, current)
+	}
+	return nil
 }
 
 func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {
 	if stream == nil {
 		return nil
+	}
+	if reason == shellRecoveryReasonDispatchDeadline {
+		return service.failUnacknowledgedShellDispatch(stream, pending)
 	}
 	pending.ShellRecoveryScheduled = true
 	markExecCompleted(stream, pending)
@@ -221,6 +273,36 @@ func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pendin
 	return service.reconcileStream(stream)
 }
 
+func (service *Service) failUnacknowledgedShellDispatch(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	pending.ShellRecoveryScheduled = true
+	markExecCompleted(stream, pending)
+	message := fmt.Sprintf("shell dispatch was not acknowledged by the Cursor client within %dms", shellDispatchRecoveryTimeout.Milliseconds())
+	log.Printf(
+		"forwarder shell dispatch unacknowledged request_id=%s tool_call_id=%s message_id=%d exec_id=%s stream_state=%s",
+		strings.TrimSpace(stream.RequestID),
+		strings.TrimSpace(pending.ToolCallID),
+		pending.MessageID,
+		strings.TrimSpace(pending.ExecID),
+		strings.TrimSpace(pending.StreamState),
+	)
+	if _, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
+		newMetadataEntry(stream.TurnSeq, stream.RequestID, "dispatch_unacknowledged", map[string]any{
+			"tool_call_id":        pending.ToolCallID,
+			"message_id":          pending.MessageID,
+			"exec_id":             pending.ExecID,
+			"exec_kind":           pending.ExecKind,
+			"approval_state":      pending.ShellApprovalState,
+			"recent_stream_state": pending.StreamState,
+			"timeout_ms":          shellDispatchRecoveryTimeout.Milliseconds(),
+			"error":               message,
+		}),
+	}); err != nil {
+		return err
+	}
+	service.setTurnPhase(stream, TurnPhaseFailed)
+	return service.failStream(stream, "shell_dispatch_unacknowledged", fmt.Errorf("%s", message))
+}
+
 func buildSyntheticShellResultPayload(pending runtimecore.PendingExec, reason string) string {
 	sections := make([]string, 0, 2)
 	if captured := summarizeCapturedShellOutput(pending.StdoutBuffer, pending.StderrBuffer); captured != "" {
@@ -233,6 +315,8 @@ func buildSyntheticShellResultPayload(pending runtimecore.PendingExec, reason st
 	switch strings.TrimSpace(reason) {
 	case shellRecoveryReasonTransportClosed:
 		noteLines = append(noteLines, "The shell transport closed before a terminal event arrived.")
+	case shellRecoveryReasonDispatchDeadline:
+		noteLines = append(noteLines, fmt.Sprintf("The client did not acknowledge the shell dispatch within %dms.", shellDispatchRecoveryTimeout.Milliseconds()))
 	case shellRecoveryReasonForegroundDeadline:
 		noteLines = append(noteLines, fmt.Sprintf("The foreground wait window expired after %dms without a terminal event.", shellForegroundTimeoutMS(pending.ArgsJSON)))
 	default:

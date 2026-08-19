@@ -628,12 +628,52 @@ func buildShellOutputNotificationConfig(input *shellOutputNotificationArgs) *age
 	}
 }
 
+// isPythonCommand determines if a shell command invokes Python based on binary name,
+// runner name, or execution of any .py file.
+func isPythonCommand(lower string) bool {
+	if strings.Contains(lower, "python") || strings.Contains(lower, "pytest") || strings.Contains(lower, "uv run") {
+		return true
+	}
+	for field := range strings.FieldsSeq(lower) {
+		clean := strings.Trim(field, `"'`)
+		if strings.HasSuffix(clean, ".py") {
+			return true
+		}
+	}
+	return false
+}
+
+// enrichCommandForStreaming injects environment variables to disable stdout buffering
+// for runtimes like Python and Node on PowerShell when needed.
+func enrichCommandForStreaming(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
+		return cmd
+	}
+
+	lower := strings.ToLower(trimmed)
+
+	// Python / Pytest / .py file unbuffered & UTF-8 encoding
+	if isPythonCommand(lower) && !strings.Contains(lower, "pythonunbuffered") {
+		return `$env:PYTHONUNBUFFERED="1"; $env:PYTHONIOENCODING="utf-8"; ` + trimmed
+	}
+
+	// Node.js suppress warnings to avoid buffering delays
+	if (strings.HasPrefix(lower, "node ") || strings.Contains(lower, "\\node.exe") || strings.Contains(lower, "/node ")) &&
+		!strings.Contains(lower, "node_no_warnings") {
+		return `$env:NODE_NO_WARNINGS="1"; ` + trimmed
+	}
+
+	return trimmed
+}
+
 // openShell 构造 Shell 对应的流式执行桥请求。
 func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeShellArgs(toolCall.ArgsJSON)
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Shell args failed: %w", err)
 	}
+	command := enrichCommandForStreaming(args.Command)
 	timeout := shellTimeoutFromArgs(args)
 	messageID := bridge.nextID()
 	execID := fmt.Sprintf("exec-shell-%d", time.Now().UnixNano())
@@ -644,12 +684,12 @@ func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.A
 				ExecId: execID,
 				Message: &agentv1.ExecServerMessage_ShellStreamArgs{
 					ShellStreamArgs: &agentv1.ShellArgs{
-						Command:                  args.Command,
+						Command:                  command,
 						WorkingDirectory:         args.WorkingDirectory,
 						Timeout:                  timeout,
 						ToolCallId:               toolCall.CallID,
-						SimpleCommands:           buildSimpleShellCommands(args.Command),
-						ParsingResult:            buildShellParsingResultProto(args.Command),
+						SimpleCommands:           buildSimpleShellCommands(command),
+						ParsingResult:            buildShellParsingResultProto(command),
 						FileOutputThresholdBytes: uint64Ptr(40000),
 						TimeoutBehavior:          agentv1.TimeoutBehavior_TIMEOUT_BEHAVIOR_BACKGROUND,
 						HardTimeout:              int32Ptr(86400000),
@@ -2116,10 +2156,14 @@ func decodeShellArgsForResult(argsJSON []byte) shellResultArgs {
 	return args
 }
 
-// shellTimeoutFromArgs 把工具 JSON 中的 block_until_ms 映射回 proto timeout。
+func defaultShellTimeout(args shellResultArgs) int32 {
+	return 30000
+}
+
+// shellTimeoutFromArgs maps block_until_ms from tool JSON back to the proto timeout.
 func shellTimeoutFromArgs(args shellResultArgs) int32 {
 	if !args.BlockUntilMSSet {
-		return 30000
+		return defaultShellTimeout(args)
 	}
 	if args.BlockUntilMS <= 0 {
 		return 0

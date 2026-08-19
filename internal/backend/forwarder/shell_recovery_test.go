@@ -46,6 +46,60 @@ func TestInitializeRunningShellStartsForegroundDeadline(t *testing.T) {
 	}
 }
 
+func TestShellDispatchRecoveryFailsTransportWithoutCompletingTool(t *testing.T) {
+	service, stream, pending := testShellRecoveryFixture(t, "opened")
+	if pending.ShellApprovalState != runtimecore.ShellApprovalStateAwaiting {
+		t.Fatalf("shell approval state = %q, want %q", pending.ShellApprovalState, runtimecore.ShellApprovalStateAwaiting)
+	}
+
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonDispatchDeadline); err != nil {
+		t.Fatalf("dispatch recovery error = %v", err)
+	}
+	if _, found := snapshotPendingExec(stream, pending.ExecID); found {
+		t.Fatal("dispatch recovery left an unacknowledged shell pending")
+	}
+	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 0 {
+		t.Fatalf("dispatch recovery completion count = %d, want 0", completions)
+	}
+	if !shellHistoryContains(stream, "dispatch_unacknowledged") {
+		t.Fatal("dispatch recovery did not persist unacknowledged-dispatch telemetry")
+	}
+	stream.mu.Lock()
+	status := stream.Status
+	stream.mu.Unlock()
+	if status != StreamStatusFailed {
+		t.Fatalf("stream status = %q, want %q", status, StreamStatusFailed)
+	}
+}
+
+func TestShellDispatchRecoveryIsCanceledByClientAcknowledgement(t *testing.T) {
+	service, stream, pending := testShellRecoveryFixture(t, "opened")
+	service.scheduleShellDispatchRecovery(stream.RequestID, pending)
+
+	start := &agentv1.ExecClientMessage{
+		Id:     pending.MessageID,
+		ExecId: pending.ExecID,
+		Message: &agentv1.ExecClientMessage_ShellStream{
+			ShellStream: &agentv1.ShellStream{
+				Event: &agentv1.ShellStream_Start{Start: &agentv1.ShellStreamStart{}},
+			},
+		},
+	}
+	if err := service.handleExecResult(InboundIntent{RequestID: stream.RequestID, ExecClientMessage: start}); err != nil {
+		t.Fatalf("shell start error = %v", err)
+	}
+
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonDispatchDeadline); err != nil {
+		t.Fatalf("dispatch recovery after acknowledgement error = %v", err)
+	}
+	if _, found := snapshotPendingExec(stream, pending.ExecID); !found {
+		t.Fatal("dispatch timer recovered an acknowledged shell")
+	}
+	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 0 {
+		t.Fatalf("acknowledged shell completion count = %d, want 0", completions)
+	}
+}
+
 func TestShellForegroundRecoveryDoesNotCloseWhileAwaitingApproval(t *testing.T) {
 	service, stream, pending := testShellRecoveryFixture(t, "opened")
 	pending.ShellApprovalState = runtimecore.ShellApprovalStateAwaiting
@@ -257,6 +311,7 @@ func TestShellTransportCloseRecoveryCompletesToolExactlyOnce(t *testing.T) {
 func TestShellForegroundRecoveryCompletesAfterDeadline(t *testing.T) {
 	service, stream, pending := testShellRecoveryFixture(t, "streaming")
 	pending.ShellForegroundDeadline = time.Now().UTC().Add(-time.Millisecond)
+	pending.LastShellActivityAt = time.Now().UTC().Add(-shellRecentActivityGrace)
 	stream.mu.Lock()
 	stream.PendingExecs[pending.ExecID] = pending
 	stream.mu.Unlock()
@@ -265,13 +320,36 @@ func TestShellForegroundRecoveryCompletesAfterDeadline(t *testing.T) {
 		t.Fatalf("foreground recovery error = %v", err)
 	}
 	if _, found := snapshotPendingExec(stream, pending.ExecID); found {
-		t.Fatal("foreground recovery left the shell pending")
+		t.Fatal("foreground recovery left shell pending")
 	}
 	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 1 {
 		t.Fatalf("completion count = %d, want 1", completions)
 	}
 	if !shellHistoryContains(stream, "The foreground wait window expired after 30000ms") {
-		t.Fatal("foreground recovery result did not retain timeout reason")
+		t.Fatal("foreground recovery did not persist timeout result")
+	}
+}
+
+func TestShellForegroundRecoveryDefersWhileStreamIsActive(t *testing.T) {
+	service, stream, pending := testShellRecoveryFixture(t, "streaming")
+	pending.ShellForegroundDeadline = time.Now().UTC().Add(-time.Millisecond)
+	pending.LastShellActivityAt = time.Now().UTC()
+	stream.mu.Lock()
+	stream.PendingExecs[pending.ExecID] = pending
+	stream.mu.Unlock()
+
+	if err := service.recoverShellWithoutTerminalIfNeeded(stream, pending.ExecID, pending.MessageID, shellRecoveryReasonForegroundDeadline); err != nil {
+		t.Fatalf("foreground recovery error = %v", err)
+	}
+	current, found := snapshotPendingExec(stream, pending.ExecID)
+	if !found {
+		t.Fatal("active shell recovery removed shell")
+	}
+	if current.StreamState == "timed_out_detached" {
+		t.Fatalf("active shell recovery state = %#v, want active shell", current)
+	}
+	if !current.ShellForegroundDeadline.After(time.Now().UTC()) {
+		t.Fatal("active shell did not receive a foreground recovery extension")
 	}
 }
 
@@ -287,6 +365,17 @@ func TestShellForegroundRecoveryDoesNotCloseBeforeDeadline(t *testing.T) {
 	}
 	if _, found := snapshotPendingExec(stream, pending.ExecID); !found {
 		t.Fatal("recovery completed shell before its foreground deadline")
+	}
+}
+
+func TestPreCompactHookStreamCloseIsTerminal(t *testing.T) {
+	pending := runtimecore.PendingExec{ExecKind: "execute_hook_pre_compact"}
+	if !isPreCompactHookStreamClose(shellStreamClose(72), pending) {
+		t.Fatal("pre-compact hook stream_close must be terminal")
+	}
+	pending.ExecKind = "read"
+	if isPreCompactHookStreamClose(shellStreamClose(72), pending) {
+		t.Fatal("non-hook stream_close must not be terminal")
 	}
 }
 

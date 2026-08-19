@@ -11,6 +11,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -266,6 +267,7 @@ type Service struct {
 	execBridge         execbridge.ExecBridge
 	interactionBridge  interactionbridge.InteractionBridge
 	appendSeq          *appendSequenceTracker
+	runSerializers     sync.Map
 }
 
 type agentModelMemory interface {
@@ -390,7 +392,14 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		"client_kind": strings.TrimSpace(clientKind),
 	})
 	service.debug.LogBidiDecoded(ctx, requestID, intent.ConversationID, appendSeqno, clientKind, message, intent, nil)
+	if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+		service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_received", queueMessageFields)
+	}
 	if err := service.dispatchInboundIntent(intent); err != nil {
+		if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+			queueMessageFields["error"] = err.Error()
+			service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_dispatch_failed", queueMessageFields)
+		}
 		if shouldAcknowledgeInterruptedInboundIntent(intent, err) {
 			service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "dispatch_interrupted_ignored", map[string]any{
 				"kind":  strings.TrimSpace(intent.Kind),
@@ -414,8 +423,35 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		"prewarm":         intent.Prewarm,
 		"ignored_reason":  strings.TrimSpace(intent.IgnoredReason),
 	})
+	if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+		service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_dispatched", queueMessageFields)
+	}
 
 	return connect.NewResponse(&aiserverv1.BidiAppendResponse{}), nil
+}
+
+func queuedUserMessageDebugFields(clientKind string, intent InboundIntent) (map[string]any, bool) {
+	if strings.TrimSpace(clientKind) != "conversation_action" || !intent.StartsRun || intent.ClientMessage == nil {
+		return nil, false
+	}
+	action := intent.ClientMessage.GetConversationAction()
+	if action == nil || conversationActionKind(action) != "user_message_action" {
+		return nil, false
+	}
+	text := userMessageText(intent.UserMessage)
+	fields := map[string]any{
+		"client_kind":               strings.TrimSpace(clientKind),
+		"conversation_action":       conversationActionKind(action),
+		"intent_kind":               strings.TrimSpace(intent.Kind),
+		"starts_run":                intent.StartsRun,
+		"has_explicit_mode":         intent.HasExplicitMode,
+		"mode":                      intent.Mode.String(),
+		"request_id":                strings.TrimSpace(intent.RequestID),
+		"conversation_id":           strings.TrimSpace(intent.ConversationID),
+		"user_message_bytes":        len(text),
+		"user_message_text_present": strings.TrimSpace(text) != "",
+	}
+	return fields, true
 }
 
 func shouldAcknowledgeInterruptedInboundIntent(intent InboundIntent, err error) bool {
@@ -582,6 +618,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.ConversationState = runRequest.GetConversationState()
 		intent.PreFetchedBlobs = runRequest.GetPreFetchedBlobs()
 		intent.UserMessage = extractUserMessage(message)
+		intent.PrependUserMessages = extractPrependUserMessages(message)
 		intent.RequestContext = extractRequestContext(message)
 		if service.shouldIgnoreEmptyResumeRunRequest(requestID, runRequest, intent.UserMessage, intent.RequestContext) {
 			intent.Kind = "metadata"
@@ -642,6 +679,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			return InboundIntent{}, fmt.Errorf("conversation_action payload is required")
 		}
 		intent.UserMessage = extractConversationActionUserMessage(action)
+		intent.PrependUserMessages = extractConversationActionPrependUserMessages(action)
 		intent.RequestContext = extractConversationActionRequestContext(action)
 		intent.StartsRun = conversationActionStartsRun(action)
 		intent.Mode, intent.ModeSource, intent.HasExplicitMode, err = extractConversationActionMode(action)
@@ -654,7 +692,11 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			intent.CancelReason = strings.TrimSpace(item.CancelAction.GetReason())
 		default:
 			if intent.StartsRun || intent.HasExplicitMode {
-				if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil {
+				stream, routed := service.broker.Get(intent.RequestID)
+				if !routed || stream == nil {
+					stream, routed = service.broker.SingleActiveStream()
+				}
+				if stream != nil {
 					stream.mu.Lock()
 					intent.ConversationID = strings.TrimSpace(stream.ConversationID)
 					intent.ModelID = strings.TrimSpace(stream.ModelID)
@@ -669,7 +711,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 					stream.mu.Unlock()
 				}
 				if strings.TrimSpace(intent.ConversationID) == "" {
-					return InboundIntent{}, fmt.Errorf("conversation_action requires active request context")
+					return InboundIntent{}, fmt.Errorf("conversation_action requires exactly one active conversation context")
 				}
 			}
 			if intent.StartsRun {
@@ -703,6 +745,60 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 	return intent, nil
 }
 
+func (service *Service) supersedeActiveRunWithSameRequest(intent InboundIntent, nextTurnSeq int64) {
+	if service == nil || service.broker == nil || strings.TrimSpace(intent.RequestID) == "" {
+		return
+	}
+	stream, ok := service.broker.Get(intent.RequestID)
+	if !ok || stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	active := stream.ProviderActive || len(stream.PendingExecs) > 0 || len(stream.PendingInteractions) > 0 || stream.Phase == TurnPhaseWaitingExternal
+	if !active {
+		stream.mu.Unlock()
+		return
+	}
+	previousToken := stream.CurrentProviderToken
+	previousTurnSeq := stream.TurnSeq
+	if stream.ProviderCancel != nil {
+		stream.ProviderCancel()
+		stream.ProviderCancel = nil
+	}
+	stream.ProviderActive = false
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
+	stream.PendingProviderAction = providerActionNone
+	stream.PendingProviderCompletion = nil
+	stream.PendingCompaction = nil
+	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
+	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
+	stream.TimerTokens = make(map[string]uint64)
+	stream.UpdatedAt = time.Now().UTC()
+	nextToken := stream.CurrentProviderToken
+	stream.mu.Unlock()
+	service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_superseded_same_request", map[string]any{
+		"request_id":              strings.TrimSpace(intent.RequestID),
+		"conversation_id":         strings.TrimSpace(intent.ConversationID),
+		"previous_turn_seq":       previousTurnSeq,
+		"next_turn_seq":           nextTurnSeq,
+		"previous_provider_token": previousToken,
+		"next_provider_token":     nextToken,
+	})
+}
+
+func (service *Service) executeSerializedRun(intent InboundIntent) error {
+	if service == nil || strings.TrimSpace(intent.ConversationID) == "" {
+		return service.handleRunIntent(intent)
+	}
+	candidate := &sync.Mutex{}
+	actual, _ := service.runSerializers.LoadOrStore(strings.TrimSpace(intent.ConversationID), candidate)
+	lock := actual.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	return service.handleRunIntent(intent)
+}
+
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
@@ -717,6 +813,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if err != nil {
 		return err
 	}
+	service.supersedeActiveRunWithSameRequest(intent, turnSeq)
 	if intent.RequestContext != nil {
 		if folder := normalizeAgentTranscriptsFolder(intent.RequestContext.GetEnv().GetAgentTranscriptsFolder()); folder != "" {
 			conversation.AgentTranscriptsFolder = folder
@@ -732,6 +829,23 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		initialEntries, err = buildRunEntries(intent, effectiveMode, turnSeq)
 		if err != nil {
 			return err
+		}
+	} else if !intent.Prewarm && !intent.ManualCompaction.Requested {
+		// 检查是否所有 user messages 都已经在历史中执行完毕，防止 unqueue 时重复执行旧 prompt
+		targetUser, remainingPrepends, hasNewWork := filterUnprocessedUserMessages(intent, conversation)
+		if !hasNewWork {
+			service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "unprocessed_user_messages_empty", map[string]any{
+				"reason": "all_user_messages_already_present_in_history",
+			})
+			return nil
+		}
+		if targetUser != intent.UserMessage || len(remainingPrepends) != len(intent.PrependUserMessages) {
+			intent.UserMessage = targetUser
+			intent.PrependUserMessages = remainingPrepends
+			initialEntries, err = buildRunEntries(intent, effectiveMode, turnSeq)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	if service.store != nil {
@@ -803,8 +917,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.BackgroundShellsByMessageID = make(map[uint32]string)
 	stream.BackgroundShellsByExecID = make(map[string]string)
 	stream.TimerTokens = make(map[string]uint64)
-	stream.CurrentProviderToken = 0
-	stream.CurrentCompactionToken = 0
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
 	stream.ProviderAccumulatedText = ""
 	stream.ProviderAccumulatedReasoning = ""
 	stream.ProviderAccumulatedReasoningSignature = ""
@@ -1058,6 +1172,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 		return fmt.Errorf("pending exec not found")
 	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
+	}
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
@@ -1168,6 +1285,9 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecControl(stream, pending, intent.ExecClientControlMessage)
 	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
+	}
 	if isHiddenWriteExecKind(pending.ExecKind) {
 		return service.handleHiddenWriteExecControl(stream, pending, intent.ExecClientControlMessage)
 	}
@@ -1176,6 +1296,10 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	if !result.IsTerminal {
+		if isPreCompactHookStreamClose(intent.ExecClientControlMessage, pending) {
+			markExecCompleted(stream, pending)
+			return service.handlePreCompactTerminal(stream, pending.ProviderPass, "")
+		}
 		if shouldRecoverNonStreamingExecOnStreamClose(intent.ExecClientControlMessage, pending) {
 			markExecTransportClosed(stream, pending)
 			service.scheduleNonStreamingExecRecovery(intent.RequestID, pending)
@@ -1214,6 +1338,18 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func isPreCompactHookStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
+	if message == nil || strings.TrimSpace(pending.ExecKind) != "execute_hook_pre_compact" {
+		return false
+	}
+	switch message.GetMessage().(type) {
+	case *agentv1.ExecClientControlMessage_StreamClose:
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldRecoverNonStreamingExecOnStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
@@ -1966,6 +2102,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
+		service.scheduleShellDispatchRecovery(stream.RequestID, pendingExec)
 		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
 		removePendingExec := func() {
 			stream.mu.Lock()
@@ -2385,7 +2522,8 @@ func (service *Service) completeSuccessfulTurn(stream *ActiveStream, completion 
 			err,
 		)
 	}
-	return service.publishCheckpointWithCompletion(requestID, conversationID, &completion)
+	_ = service.publishCheckpoint(requestID, conversationID)
+	return service.finishSuccessfulTurnAfterCheckpoint(stream, completion)
 }
 
 func (service *Service) finishSuccessfulTurnAfterCheckpoint(stream *ActiveStream, completion pendingTurnCompletion) error {
@@ -2611,12 +2749,9 @@ func (service *Service) failActiveStream(stream *ActiveStream, conversationID st
 			err,
 		)
 	}
-	terminal := failedCheckpointTerminalAction(terminalCode, terminalMessage)
-	if err := service.publishCheckpointWithTerminalAction(requestID, terminal); err != nil {
-		log.Printf("forwarder checkpoint queue before failed terminal skipped request_id=%s err=%v", strings.TrimSpace(requestID), err)
-		return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
-	}
-	return nil
+	service.discardPendingCheckpoint(stream, "stream failed")
+	_ = service.publishCheckpoint(requestID, conversationID)
+	return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
 }
 
 // buildRunEntries 构造一次 run intent 需要写入 history 的首批 entry。
@@ -2636,6 +2771,33 @@ func buildRunEntries(intent InboundIntent, effectiveMode agentv1.AgentMode, turn
 				Kind:      "request_context",
 				Payload:   payload,
 			})
+		}
+	}
+	for _, prependMsg := range intent.PrependUserMessages {
+		if prependMsg == nil {
+			continue
+		}
+		if intent.UserMessage != nil && strings.TrimSpace(prependMsg.GetMessageId()) != "" && strings.TrimSpace(prependMsg.GetMessageId()) == strings.TrimSpace(intent.UserMessage.GetMessageId()) {
+			continue
+		}
+		normalized := normalizeUserMessageForStorage(prependMsg)
+		payload, err := protojson.Marshal(normalized)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, HistoryEntry{
+			TurnSeq:   turnSeq,
+			RequestID: intent.RequestID,
+			Role:      "user",
+			Kind:      "user_message",
+			Payload:   payload,
+		})
+		if commandMessage, ok := promptengine.BuildSelectedCursorCommandsReplayMessage(normalized); ok {
+			entries = append(entries, newPromptContextEntry(turnSeq, intent.RequestID, newPromptContextMessage(
+				promptContextSourceSelectedCursorCommands,
+				modeladapter.Message{Role: commandMessage.Role, Content: commandMessage.Content},
+				true,
+			)))
 		}
 	}
 	if intent.UserMessage != nil {
@@ -2813,11 +2975,30 @@ func extractUserMessage(message *agentv1.AgentClientMessage) *agentv1.UserMessag
 	}
 	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetUserMessage()
+		if userMsg := item.UserMessageAction.GetUserMessage(); userMsg != nil {
+			return userMsg
+		}
+		if prepends := item.UserMessageAction.GetPrependUserMessages(); len(prepends) > 0 {
+			return prepends[len(prepends)-1]
+		}
+		return nil
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
 	case *agentv1.ConversationAction_ExecutePlanAction:
 		return &agentv1.UserMessage{Text: executePlanDirective}
+	default:
+		return nil
+	}
+}
+
+// extractPrependUserMessages 从 legacy run_request 中提取 prepend 用户消息列表。
+func extractPrependUserMessages(message *agentv1.AgentClientMessage) []*agentv1.UserMessage {
+	if message == nil || message.GetRunRequest() == nil || message.GetRunRequest().GetAction() == nil {
+		return nil
+	}
+	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
+	case *agentv1.ConversationAction_UserMessageAction:
+		return item.UserMessageAction.GetPrependUserMessages()
 	default:
 		return nil
 	}
@@ -2854,8 +3035,14 @@ func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runR
 		return false
 	}
 	conversationID := strings.TrimSpace(runRequest.GetConversationId())
-	if conversationID == "" || service.hasActiveConversationStream(conversationID, requestID) {
+	if conversationID == "" {
 		return false
+	}
+	// A reconnect may issue a payload-free resume while the original turn is
+	// still active. It carries no work to resume, so accepting it would create
+	// a new run that immediately cancels the active one as "superseded".
+	if service.hasActiveConversationStream(conversationID, requestID) {
+		return true
 	}
 	conversation, err := service.loadConversationForResumeGuard(conversationID)
 	if err != nil || conversation == nil {
@@ -2930,11 +3117,29 @@ func extractConversationActionUserMessage(action *agentv1.ConversationAction) *a
 	}
 	switch item := action.GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetUserMessage()
+		if userMsg := item.UserMessageAction.GetUserMessage(); userMsg != nil {
+			return userMsg
+		}
+		if prepends := item.UserMessageAction.GetPrependUserMessages(); len(prepends) > 0 {
+			return prepends[len(prepends)-1]
+		}
+		return nil
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
 	case *agentv1.ConversationAction_ExecutePlanAction:
 		return &agentv1.UserMessage{Text: executePlanDirective}
+	default:
+		return nil
+	}
+}
+
+func extractConversationActionPrependUserMessages(action *agentv1.ConversationAction) []*agentv1.UserMessage {
+	if action == nil {
+		return nil
+	}
+	switch item := action.GetAction().(type) {
+	case *agentv1.ConversationAction_UserMessageAction:
+		return item.UserMessageAction.GetPrependUserMessages()
 	default:
 		return nil
 	}

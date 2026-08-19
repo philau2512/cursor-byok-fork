@@ -256,9 +256,9 @@ type PendingExec struct {
 	LastShellHeartbeatAt time.Time
 	// ShellForegroundDeadline 表示前台 shell 预计最晚应收到终态的时间点。
 	ShellForegroundDeadline time.Time
-	// ShellRecoveryScheduled 标记是否已经为该 shell 安排了异常收口协程。
+	// ShellRecoveryScheduled marks whether an abnormal shell recovery has already been scheduled.
 	ShellRecoveryScheduled bool
-	// StdoutBuffer 保存当前 shell 已累计的 stdout 文本。
+	// StdoutBuffer stores accumulated shell stdout text.
 	StdoutBuffer string
 	// StderrBuffer 保存当前 shell 已累计的 stderr 文本。
 	StderrBuffer string
