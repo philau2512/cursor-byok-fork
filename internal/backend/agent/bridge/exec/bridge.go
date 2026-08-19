@@ -2156,10 +2156,14 @@ func decodeShellArgsForResult(argsJSON []byte) shellResultArgs {
 	return args
 }
 
-// shellTimeoutFromArgs 把工具 JSON 中的 block_until_ms 映射回 proto timeout。
+func defaultShellTimeout(args shellResultArgs) int32 {
+	return 30000
+}
+
+// shellTimeoutFromArgs maps block_until_ms from tool JSON back to the proto timeout.
 func shellTimeoutFromArgs(args shellResultArgs) int32 {
 	if !args.BlockUntilMSSet {
-		return 30000
+		return defaultShellTimeout(args)
 	}
 	if args.BlockUntilMS <= 0 {
 		return 0

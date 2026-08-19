@@ -95,3 +95,9 @@ func TestOpenShellEnrichesCommand(t *testing.T) {
 		t.Fatalf("pending ExecKind = %q, want shell", pending.ExecKind)
 	}
 }
+
+func TestDefaultShellTimeout(t *testing.T) {
+	if timeout := defaultShellTimeout(shellResultArgs{Command: "python test.py"}); timeout != 30000 {
+		t.Fatalf("defaultShellTimeout() = %d, want 30000", timeout)
+	}
+}

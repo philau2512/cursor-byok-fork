@@ -830,7 +830,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		if err != nil {
 			return err
 		}
-	} else if !intent.Prewarm {
+	} else if !intent.Prewarm && !intent.ManualCompaction.Requested {
 		// 检查是否所有 user messages 都已经在历史中执行完毕，防止 unqueue 时重复执行旧 prompt
 		targetUser, remainingPrepends, hasNewWork := filterUnprocessedUserMessages(intent, conversation)
 		if !hasNewWork {
@@ -1296,6 +1296,10 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	if !result.IsTerminal {
+		if isPreCompactHookStreamClose(intent.ExecClientControlMessage, pending) {
+			markExecCompleted(stream, pending)
+			return service.handlePreCompactTerminal(stream, pending.ProviderPass, "")
+		}
 		if shouldRecoverNonStreamingExecOnStreamClose(intent.ExecClientControlMessage, pending) {
 			markExecTransportClosed(stream, pending)
 			service.scheduleNonStreamingExecRecovery(intent.RequestID, pending)
@@ -1334,6 +1338,18 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func isPreCompactHookStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
+	if message == nil || strings.TrimSpace(pending.ExecKind) != "execute_hook_pre_compact" {
+		return false
+	}
+	switch message.GetMessage().(type) {
+	case *agentv1.ExecClientControlMessage_StreamClose:
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldRecoverNonStreamingExecOnStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {

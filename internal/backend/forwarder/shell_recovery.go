@@ -11,6 +11,7 @@ import (
 
 const shellTerminalRecoveryGrace = 1500 * time.Millisecond
 const shellDispatchRecoveryTimeout = 30 * time.Second
+const shellRecentActivityGrace = 30 * time.Second
 
 const (
 	shellRecoveryReasonDispatchDeadline   = "dispatch_deadline_exceeded"
@@ -189,7 +190,31 @@ func (service *Service) recoverShellWithoutTerminalIfNeeded(stream *ActiveStream
 	if reason == shellRecoveryReasonForegroundDeadline && !current.ShellForegroundDeadline.IsZero() && time.Now().UTC().Before(current.ShellForegroundDeadline) {
 		return nil
 	}
+	if reason == shellRecoveryReasonForegroundDeadline {
+		now := time.Now().UTC()
+		if current.LastShellActivityAt.Add(shellRecentActivityGrace).After(now) {
+			return service.extendShellForegroundRecovery(stream, current, current.LastShellActivityAt.Add(shellRecentActivityGrace))
+		}
+	}
 	return service.recoverShellWithoutTerminal(stream, current, reason)
+}
+
+func (service *Service) extendShellForegroundRecovery(stream *ActiveStream, pending runtimecore.PendingExec, deadline time.Time) error {
+	if stream == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	current, found := stream.PendingExecs[pending.ExecID]
+	if found {
+		current.ShellForegroundDeadline = deadline
+		stream.PendingExecs[pending.ExecID] = current
+		stream.UpdatedAt = time.Now().UTC()
+	}
+	stream.mu.Unlock()
+	if found {
+		service.scheduleShellForegroundRecovery(stream.RequestID, current)
+	}
+	return nil
 }
 
 func (service *Service) recoverShellWithoutTerminal(stream *ActiveStream, pending runtimecore.PendingExec, reason string) error {

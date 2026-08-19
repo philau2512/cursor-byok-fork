@@ -2,6 +2,98 @@
 
 > Record local changes by date, newest first. Each change uses a `## YYYY-MM-DD` heading and a separate `###` entry.
 
+## 2026-08-19
+
+### Fixed: Checkpoint blob lockup on failed turns and prompt deduplication
+
+### Changes
+
+- **Immediate failed terminal events**: `failActiveStream` now discards pending checkpoint blob synchronization and triggers the failed terminal event (`broker.Fail` / `StreamEvent.End`) immediately upon upstream errors, preventing Cursor UI from hanging indefinitely.
+- **Prepend user messages & deduplication**: Supported extracting `PrependUserMessages` from user actions and deduplicating completed message IDs against conversation history to avoid replaying prior turns on unqueue.
+
+### Regression coverage
+
+- Updated `TestCheckpointBlobSyncPublishesFailedTerminalImmediately` and `TestCheckpointBlobTimeoutStillPublishesFailedTerminal` in `internal/backend/forwarder`.
+- Added tests for prepend user messages and queue deduplication.
+
+### Verification
+
+```powershell
+go test ./internal/backend/forwarder/...
+go test ./...
+```
+
+## 2026-08-18
+
+### Changed: Performance optimization, shell recovery, and tool caching
+
+### Changes
+
+- **Prompt and tool caching**: Introduced caching for baseline tools, sanitized prompts, and tool catalogs across modes to eliminate redundant disk reads.
+- **Shell dispatch recovery**: Added a recovery timer and mechanism when client fails to acknowledge shell execution within the dispatch deadline.
+- **Python / Node.js unbuffered streaming**: Enriched PowerShell shell commands with environment flags (`PYTHONUNBUFFERED=1`, `NODE_NO_WARNINGS=1`) to eliminate stdout buffering during command streaming.
+- **Compact context serialization**: Serialized conversation context snapshots with compact JSON (omitting extra whitespace) to save memory, disk I/O, and CPU time.
+- **Active conversation protection**: Added logic and tests to ignore empty resume run requests while a turn is actively running.
+- **Enhanced checkpoint blob management**: Refactored timer tokens and pending blob metadata tracking with lifecycle metrics.
+- **MITM disconnect logging**: Streamlined client disconnect log filters.
+
+## 2026-08-17
+
+### Changed: Forwarder lifecycle cleanup and task guidelines
+
+### Changes
+
+- **Forwarder host module management**: Added formal forwarder service lifecycle management and graceful flush/closure in `UsageFileStore` upon host shutdown.
+- **Prompt and task management guidelines**: Enhanced common prefix prompt documentation with clear rules for proactive concurrent subagent execution, task delegation, and structured lossless conversation compaction.
+
+## 2026-08-15
+
+### Changed: Commit prompt and compaction refinement
+
+### Changes
+
+- Clarified instructions and formatting rules for commit message generation.
+- Expanded conversation compaction guidelines for structured retention.
+
+## 2026-08-14
+
+### Changed: Latency instrumentation and plan tracking
+
+### Changes
+
+- **Provider pass latency metrics**: Instrumented compile, TTFT, cache hit, and total duration metrics for provider-pass diagnostics while maintaining lossless replay.
+- **Untracked local plans**: Configured `.gitignore` to keep local planning artifacts out of git tracking.
+
+## 2026-08-13
+
+### Fixed: Retain MCP registry when request context is absent
+
+### Changes
+
+- Ensured MCP tool registry snapshot is retained and persisted even when inbound request context is omitted.
+
+## 2026-08-12
+
+### Changed: Upstream v0.0.48 sync, per-user CA, and content-addressed images
+
+### Changes
+
+- **Sync upstream v0.0.48**: Merged upstream release updates and build configurations.
+- **Per-installation Root CA**: Generated unique, per-installation root CA certificates rather than using a shared static certificate.
+- **Content-addressed Read images**: Supported image reading via local tools with content hash persistence.
+- **Deterministic MCP snapshotting**: Snapshotted MCP registry per request, filtering out disabled servers and normalizing server aliases.
+- **Language policy cleanup**: Reverted downstream language policy injection in favor of shared rules.
+
+## 2026-08-11
+
+### Changed: Optional reasoning effort and plan execution directive
+
+### Changes
+
+- **Optional reasoning effort**: Supported models/providers that do not accept reasoning effort parameters.
+- **Execute plan directive**: Introduced directive to execute current plans directly within conversation actions.
+- **AwaitShell polling refinement**: Finalized polling until shell completion.
+
 ## 2026-08-10
 
 ### Changed: Sync upstream and expand the conversation forwarder
