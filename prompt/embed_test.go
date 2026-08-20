@@ -88,9 +88,9 @@ func TestAskPromptContractForbidsMutations(t *testing.T) {
 		t.Fatalf("ReadPrompt(ask): %v", err)
 	}
 	for _, required := range []string{
-		"你绝对不能进行任何编辑",
-		"运行任何非只读工具",
-		"你绝不能亲自实现",
+		"must not make any edits",
+		"run any non-read-only tools",
+		"must not implement it yourself",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("Ask prompt missing contract %q", required)
