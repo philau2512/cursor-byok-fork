@@ -123,22 +123,11 @@ func ReadPrompt(mode Mode) (string, error) {
 		return prompt, nil
 	}
 	path := fmt.Sprintf("%s/prompt.md", normalized)
-	if normalized == ModeSubagent || normalized == ModeDebug {
-		data, err := assetFS.ReadFile(path)
-		if err != nil {
-			return "", fmt.Errorf("read prompt asset %q: %w", path, err)
-		}
-		return string(data), nil
-	}
-	prefix, err := assetFS.ReadFile("common_prefix.md")
-	if err != nil {
-		return "", fmt.Errorf("read prompt common prefix asset %q: %w", "common_prefix.md", err)
-	}
 	data, err := assetFS.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read prompt asset %q: %w", path, err)
 	}
-	return string(prefix) + "\n\n" + string(data), nil
+	return string(data), nil
 }
 
 // MustReadPrompt 读取指定模式的静态提示词文本，失败时直接 panic。

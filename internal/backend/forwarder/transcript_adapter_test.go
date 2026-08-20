@@ -195,70 +195,6 @@ func TestConversationFileStoreDefersCursorTranscriptSyncUntilTurnEnds(t *testing
 	}
 }
 
-func TestConversationFileStoreStartupBackfillSkipsActiveTurn(t *testing.T) {
-	historyRoot := filepath.Join(t.TempDir(), "history")
-	transcriptsFolder := filepath.Join(t.TempDir(), "agent-transcripts")
-	if err := os.MkdirAll(transcriptsFolder, 0o755); err != nil {
-		t.Fatalf("create transcript root: %v", err)
-	}
-	store := NewConversationFileStore(historyRoot)
-	conversation := transcriptTestConversation(nil)
-	conversation.AgentTranscriptsFolder = transcriptsFolder
-	_, err := store.SaveConversationWithEntries(conversation.ConversationID, conversation, []HistoryEntry{
-		transcriptTestUserMessageEntry(t, 1, "request-1", "change the file"),
-		newToolCallEntry(1, "request-1", "call-1", "Edit", "", "", transcriptTestEditToolCall(t, "file.txt")),
-	})
-	if err != nil {
-		t.Fatalf("SaveConversationWithEntries() error = %v", err)
-	}
-
-	path := filepath.Join(transcriptsFolder, conversation.ConversationID, conversation.ConversationID+".jsonl")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("active turn unexpectedly synced transcript; stat error = %v", err)
-	}
-
-	store.SyncAllCursorTranscriptsBestEffort()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("startup backfill unexpectedly synced active turn; stat error = %v", err)
-	}
-}
-
-func TestConversationFileStoreBackfillsTranscriptOnStartup(t *testing.T) {
-	historyRoot := filepath.Join(t.TempDir(), "history")
-	transcriptsFolder := filepath.Join(t.TempDir(), "agent-transcripts")
-	if err := os.MkdirAll(transcriptsFolder, 0o755); err != nil {
-		t.Fatalf("create transcript root: %v", err)
-	}
-	store := NewConversationFileStore(historyRoot)
-	conversation := transcriptTestConversation(nil)
-	conversation.AgentTranscriptsFolder = transcriptsFolder
-	_, err := store.SaveConversationWithEntries(conversation.ConversationID, conversation, []HistoryEntry{
-		transcriptTestUserMessageEntry(t, 1, "request-1", "hello"),
-		newAssistantTextEntry(1, "request-1", "hi", "", ""),
-		newMetadataEntry(1, "request-1", "turn_completed", nil),
-	})
-	if err != nil {
-		t.Fatalf("SaveConversationWithEntries() error = %v", err)
-	}
-	path := filepath.Join(transcriptsFolder, conversation.ConversationID, conversation.ConversationID+".jsonl")
-	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
-		t.Fatalf("remove generated transcript: %v", err)
-	}
-	if err := os.MkdirAll(transcriptsFolder, 0o755); err != nil {
-		t.Fatalf("restore transcript root: %v", err)
-	}
-
-	store.SyncAllCursorTranscriptsBestEffort()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read backfilled transcript: %v", err)
-	}
-	lines := decodeCursorTranscriptLines(t, data)
-	if len(lines) != 3 || lines[2].Type != "turn_ended" || lines[2].Status != "success" {
-		t.Fatalf("backfilled transcript = %s", data)
-	}
-}
-
 func TestNormalizeAgentTranscriptsFolderRejectsUnexpectedPaths(t *testing.T) {
 	root := t.TempDir()
 	if got := normalizeAgentTranscriptsFolder(filepath.Join(root, "agent-transcripts")); got == "" {
@@ -272,7 +208,7 @@ func TestNormalizeAgentTranscriptsFolderRejectsUnexpectedPaths(t *testing.T) {
 	}
 }
 
-func TestConversationFileStoreReplacesCursorAppendedTurnEnded(t *testing.T) {
+func TestConversationFileStorePreservesCursorAppendedTurnEnded(t *testing.T) {
 	historyRoot := filepath.Join(t.TempDir(), "history")
 	transcriptsFolder := filepath.Join(t.TempDir(), "agent-transcripts")
 	store := NewConversationFileStore(historyRoot)
@@ -283,15 +219,21 @@ func TestConversationFileStoreReplacesCursorAppendedTurnEnded(t *testing.T) {
 		transcriptTestUserMessageEntry(t, 1, "request-1", "hello"),
 		newAssistantTextEntry(1, "request-1", "done", "", ""),
 		newMetadataEntry(1, "request-1", "turn_completed", nil),
+		transcriptTestUserMessageEntry(t, 2, "request-2", "continue"),
+		newAssistantTextEntry(2, "request-2", "working", "", ""),
 	})
 	if err != nil {
 		t.Fatalf("SaveConversationWithEntries() error = %v", err)
 	}
 
 	path := filepath.Join(transcriptsFolder, conversation.ConversationID, conversation.ConversationID+".jsonl")
-	stale := []byte("{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n{\"type\":\"turn_ended\",\"status\":\"success\"}\n{\"type\":\"turn_ended\",\"status\":\"aborted\",\"error\":\"User aborted request\"}\n")
-	if err := os.WriteFile(path, stale, 0o644); err != nil {
-		t.Fatalf("write stale transcript: %v", err)
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	appended := append(existing, []byte(`{"type":"turn_ended","status":"aborted","error":"User aborted request"}`+"\n")...)
+	if err := os.WriteFile(path, appended, 0o644); err != nil {
+		t.Fatalf("append terminal status: %v", err)
 	}
 
 	persisted, err := store.LoadConversation(conversation.ConversationID)
@@ -307,8 +249,8 @@ func TestConversationFileStoreReplacesCursorAppendedTurnEnded(t *testing.T) {
 		t.Fatalf("read synced transcript: %v", err)
 	}
 	lines := decodeCursorTranscriptLines(t, data)
-	if len(lines) != 3 || lines[2].Type != "turn_ended" || lines[2].Status != "success" {
-		t.Fatalf("synced transcript retained stale terminal state: %s", data)
+	if len(lines) != 5 || lines[3].Role != "assistant" || lines[4].Type != "turn_ended" || lines[4].Status != "aborted" {
+		t.Fatalf("synced transcript did not preserve appended terminal state: %s", data)
 	}
 }
 

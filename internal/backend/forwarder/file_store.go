@@ -518,10 +518,6 @@ func (store *ConversationFileStore) syncCursorTranscriptBestEffort(conversationI
 }
 
 func (store *ConversationFileStore) syncCursorTranscript(conversationID string, conversation *ConversationFile, transcriptsFolder string) error {
-	return store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, transcriptsFolder, true)
-}
-
-func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(conversationID string, conversation *ConversationFile, transcriptsFolder string, includeLatestStatus bool) error {
 	if store == nil || conversation == nil {
 		return nil
 	}
@@ -529,42 +525,15 @@ func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(convers
 	if err != nil {
 		return err
 	}
-	data, err := projectCursorTranscriptJSONLWithLatestStatus(conversation, includeLatestStatus)
+	data, err := projectCursorTranscriptJSONLWithLatestStatus(conversation, true)
 	if err != nil {
 		return err
 	}
 	if len(data) == 0 {
 		return nil
 	}
+	data = preserveCursorAppendedTurnEnded(path, data)
 	return writeCursorTranscriptAtomic(path, data)
-}
-
-func (store *ConversationFileStore) SyncAllCursorTranscriptsBestEffort() {
-	if store == nil {
-		return
-	}
-	conversationIDs, err := store.ListConversationIDs()
-	if err != nil {
-		log.Printf("forwarder transcript backfill scan failed err=%v", err)
-		return
-	}
-	for _, conversationID := range conversationIDs {
-		conversation, err := store.LoadConversation(conversationID)
-		if err != nil {
-			log.Printf("forwarder transcript backfill load failed conversation_id=%s err=%v", conversationID, err)
-			continue
-		}
-		if conversation == nil || conversation.AgentTranscriptsFolder == "" || !conversationTranscriptSyncReady(conversation) {
-			continue
-		}
-		info, err := os.Stat(conversation.AgentTranscriptsFolder)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		if err := store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, conversation.AgentTranscriptsFolder, true); err != nil {
-			log.Printf("forwarder transcript backfill failed conversation_id=%s err=%v", conversationID, err)
-		}
-	}
 }
 
 func contextVersionForEntries(entries []HistoryEntry) int64 {
