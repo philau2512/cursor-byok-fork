@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -97,3 +98,35 @@ func TestAskPromptContractForbidsMutations(t *testing.T) {
 		}
 	}
 }
+
+func TestAllToolCatalogsAreValidJSONAndConsistent(t *testing.T) {
+	for _, mode := range []Mode{ModeAgent, ModeAsk, ModePlan, ModeDebug, ModeMultitask, ModeSubagent} {
+		raw, err := ReadTools(mode)
+		if err != nil {
+			t.Fatalf("ReadTools(%s): %v", mode, err)
+		}
+		var tools []struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				Parameters  map[string]any `json:"parameters"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tools); err != nil {
+			t.Fatalf("Unmarshal tools for mode %s: %v", mode, err)
+		}
+		if len(tools) == 0 {
+			t.Fatalf("tools for mode %s is empty", mode)
+		}
+		for _, tool := range tools {
+			if tool.Function.Name == "" {
+				t.Fatalf("tool in mode %s has empty function name", mode)
+			}
+			if tool.Function.Description == "" {
+				t.Fatalf("tool %s in mode %s has empty description", tool.Function.Name, mode)
+			}
+		}
+	}
+}
+

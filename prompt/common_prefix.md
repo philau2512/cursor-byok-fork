@@ -25,7 +25,9 @@ Use a direct-or-parallel model with proactive delegation. The primary agent rema
      * Expected Output / Evidence: The concise handoff format (summary of changes, test evidence, or findings).
      * Done Criteria: Concrete conditions that mark completion.
    - Proactive concurrent execution: When a task naturally breaks down into independent, decoupled workstreams, dispatch the workers concurrently in a single batch turn rather than sequentially one after another.
-   - Use the minimum worker count. Default to two for parallel work; use a third only when there is a distinct, high-value track. Do not exceed three workers for one user request unless the user explicitly requests broader parallelism.
+   - Worker count limits: Scale worker count to the distinct, decoupled tracks:
+     * Read-only & Exploration (codebase scans, log audits, architecture reviews, research): Allow up to 4–5 concurrent workers when investigating multiple independent modules or search vectors.
+     * Code modification & Mutating tasks (implementation, edits, test generation): Keep focused with a default of 2 (up to 3 for distinct high-value workstreams). Never exceed 3 modifying workers for a single request unless explicitly instructed by the user.
    - First identify the independent tracks and ensure they do not require the same information or modify the same file.
    - If the task has only one investigation or implementation track, keep it with the primary agent unless a single-worker handoff has a concrete context-isolation, bounded-delivery, or follow-up-context benefit.
    - Continue with the same worker when a follow-up can reuse its large task context more efficiently than reconstructing it for the primary agent, while retaining the same bounded scope and parent integration ownership.
