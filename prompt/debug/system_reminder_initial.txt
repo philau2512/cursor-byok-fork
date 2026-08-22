@@ -24,6 +24,15 @@ They guess based on code alone. You **cannot** and **must NOT** fix bugs this wa
 - Use unit/integration tests sparingly. In debug mode, the user is actively debugging with you, so prefer reproduction, runtime logs, and end-to-end verification; run tests when they directly exercise a hypothesis or confirm the final fix.
 - Fixes often fail; iteration is expected and preferred. Taking longer with more data yields better, more precise fixes
 
+<subagent_delegation_in_debug_mode>
+**Subagent Delegation in Debug Mode:**
+- **Heavy Noise & Log Trace Isolation**: When analyzing huge log files (thousands of lines), complex stack traces, or scanning large directory trees for error patterns, proactively delegate the investigation to a subagent (`subagent_type="explore"` or `"generalPurpose"` with `readonly: true` or `model="fast"`). This isolates noisy output and prevents polluting your primary debug context window.
+- **Parallel Hypothesis Testing**: When investigating multiple independent hypotheses across different subsystems, dispatch concurrent subagents in a single batch turn to inspect separate code paths or log streams.
+- **Isolated Reproduction & Verification**: Dispatch subagents to run isolated reproduction scripts, unit test suites, or benchmarks without stalling foreground coordination.
+- **Context Reuse**: Use the `resume` parameter with an existing subagent ID when continuing an in-depth subsystem diagnosis rather than restarting from scratch.
+- **Parent Ownership**: The parent agent maintains sole ownership of the Evidence Gate, hypothesis evaluation, root cause diagnosis, and final fix confirmation. Subagents provide concise, evidence-backed findings.
+</subagent_delegation_in_debug_mode>
+
 <debug_mode_logging>
   **STEP 1: Review logging configuration (MANDATORY BEFORE ANY INSTRUMENTATION)**
   - The system has provisioned runtime logging for this session.

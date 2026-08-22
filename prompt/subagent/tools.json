@@ -1,6 +1,81 @@
 [
   {
     "function": {
+      "description": "Call an MCP tool by server identifier and tool name with arbitrary JSON arguments. IMPORTANT: Always read the tool's schema/descriptor BEFORE calling to ensure correct parameters.\n\nExample:\n{\n  \"server\": \"my-mcp-server\",\n  \"toolName\": \"search\",\n  \"arguments\": { \"query\": \"example\", \"limit\": 10 }\n}",
+      "name": "CallMcpTool",
+      "parameters": {
+        "properties": {
+          "arguments": {
+            "description": "Arguments to pass to the MCP tool, as described in the tool descriptor.",
+            "type": "object"
+          },
+          "server": {
+            "description": "Identifier of the MCP server hosting the tool.",
+            "type": "string"
+          },
+          "toolName": {
+            "description": "Name of the MCP tool to invoke.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server",
+          "toolName"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Deletes a file at the specified path. The operation will fail gracefully if:\n    - The file doesn't exist\n    - The operation is rejected for security reasons\n    - The file cannot be deleted",
+      "name": "Delete",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "The absolute path of the file to delete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Reads a specific resource from an MCP server, identified by server name and resource URI. Optionally, set downloadPath (relative to the workspace) to save the resource to disk; when set, the resource will be downloaded and not returned to the model.",
+      "name": "FetchMcpResource",
+      "parameters": {
+        "properties": {
+          "downloadPath": {
+            "description": "Optional relative path in the workspace to save the resource to. When set, the resource is written to disk and is not returned to the model.",
+            "type": "string"
+          },
+          "server": {
+            "description": "The MCP server identifier",
+            "type": "string"
+          },
+          "uri": {
+            "description": "The resource URI to read",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server",
+          "uri"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
       "description": "\nTool to search for files matching a glob pattern\n\n- Works fast with codebases of any size\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches that are potentially useful as a batch.\n",
       "name": "Glob",
       "parameters": {
@@ -24,7 +99,7 @@
   },
   {
     "function": {
-      "description": "A powerful search tool built on ripgrep\nUsage:\n- Prefer using Grep for search tasks when you know the exact symbols or strings to search for. Whenever possible, use this tool instead of invoking grep or rg as a terminal command. The Grep tool has been optimized for speed and file restrictions inside Cursor.\n- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n- Filter files with glob parameter (e.g., \".js\", \"**/.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n- Output modes: \"content\" shows matching lines (default), \"files_with_matches\" shows only file paths, \"count\" shows match counts\n- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use interface\\{\\} to find interface{} in Go code)\n- Multiline matching: By default patterns match within single lines only. For cross-line patterns like struct \\{[\\s\\S]*?field, use multiline: true\n- Results are capped to several thousand output lines for responsiveness; when truncation occurs, the results report \"at least\" counts, but are otherwise accurate.\n- Content output formatting closely follows ripgrep output format: '-' for context lines, ':' for match lines, and all context/match lines below each file group.",
+      "description": "A search tool built on ripgrep. Results are capped to several thousand output lines for responsiveness; when truncation occurs, the results report \"at least\" counts, but are otherwise accurate.",
       "name": "Grep",
       "parameters": {
         "properties": {
@@ -94,7 +169,7 @@
   },
   {
     "function": {
-      "description": "Reads a file from the local filesystem. You can access any file directly by using this tool.\nIf the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Lines in the output are numbered starting at 1, using following format: LINE_NUMBER|LINE_CONTENT\n- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.\n- If you read a file that exists but has empty contents you will receive 'File is empty.'\n\nImage Support:\n- This tool can also read image files when called with the appropriate path.\n- Supported image formats: jpeg/jpg, png, gif, webp.\n\nPDF Support:\n- PDF files are converted into text content automatically (subject to the same character limits as other files).\n\nLine endings: On Windows or some client read paths, partial reads may display line endings normalized to LF even when the file uses CRLF or CR. Use the visible text normally when reporting evidence.",
+      "description": "Reads a file from the local filesystem. You can access any file directly by using this tool.\nIf the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Lines in the output are numbered starting at 1, using following format: LINE_NUMBER|LINE_CONTENT\n- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.\n- If you read a file that exists but has empty contents you will receive 'File is empty.'\n\nImage Support:\n- This tool can also read image files when called with the appropriate path.\n- Supported image formats: jpeg/jpg, png, gif, webp.\n\nPDF Support:\n- PDF files are converted into text content automatically (subject to the same character limits as other files).",
       "name": "Read",
       "parameters": {
         "properties": {
@@ -140,6 +215,424 @@
         "required": [
           "path"
         ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Read and display linter errors from the current workspace. You can provide paths to specific files or directories, or omit the argument to get diagnostics for all files.",
+      "name": "ReadLints",
+      "parameters": {
+        "properties": {
+          "paths": {
+            "description": "Optional. An array of paths to files or directories to read linter errors for. You can use either relative paths in the workspace or absolute paths. If provided, returns diagnostics for the specified files/directories only. If not provided, returns diagnostics for all files in the workspace.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Executes a given command in a shell session, waiting for output for `block_until_ms` millis.\nYou can monitor commands by configuring `notify_on_output`. You will be notified at the end of your turn whenever stdout/stderr output matches the regex `pattern`. Output redirected only to a file will not trigger it. Configure a 5-or-fewer-word `reason` explaining what you are watching for, and optionally configure `debounce_ms`.",
+      "name": "Shell",
+      "parameters": {
+        "properties": {
+          "block_until_ms": {
+            "description": "How long to block and wait for the command to complete before moving it to background (in milliseconds). Defaults to 30000ms (30 seconds). Set to 0 to immediately run the command in the background. The timer includes the shell startup time.",
+            "type": "number"
+          },
+          "command": {
+            "description": "The command to execute",
+            "type": "string"
+          },
+          "description": {
+            "description": "Clear, concise description of what this command does in 5-10 words",
+            "type": "string"
+          },
+          "notify_on_output": {
+            "description": "Optional watcher for backgrounded command output. You will be notified at the end of your turn whenever output matches the regex pattern. Use stable sentinel lines and simple anchored regexes; do not match all output. Completion notifications are separate and do not require this field.",
+            "properties": {
+              "debounce_ms": {
+                "description": "Minimum milliseconds between notifications. Values below 5000ms are treated as 5000ms.",
+                "type": "number"
+              },
+              "notification_limit": {
+                "description": "Optional maximum number of output-match notifications for this command.",
+                "type": "number"
+              },
+              "pattern": {
+                "description": "Regex pattern to match against command output.",
+                "type": "string"
+              },
+              "reason": {
+                "description": "Five or fewer words describing what you are watching for. The UI prefixes it as Monitored `reason`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern",
+              "reason"
+            ],
+            "type": "object"
+          },
+          "working_directory": {
+            "description": "The absolute path to the working directory to execute the command in (defaults to current directory)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Check or poll a backgrounded Shell job. Use this after Shell returns a shell_id. If Shell returned a shell_id for a known background job, every AwaitShell call for that job MUST pass that exact non-empty shell_id. Never omit shell_id or pass an empty string when polling a known background job. Omitting shell_id is allowed only when there is no known background job and the caller intentionally wants a timed wait. If multiple jobs are running, explicitly pass the shell_id for the intended job. Pattern matching checks accumulated stdout/stderr content, not terminal metadata.\n\nDo not poll reflexively while unrelated work can continue. However, you MUST call AwaitShell with the matching shell_id before reporting that a background job has completed, passed, failed, produced an artifact, or is ready for the user. This is required whenever the user's request depends on the job result, including builds, tests, deployments, downloads, migrations, packaging, and artifact generation.\n\nIf ending the turn while a job is still running, explicitly state that it is still running; do not imply completion. Do not mark a related task complete or send a final result until AwaitShell returns completion for that job. After AwaitShell reports completion, inspect the exit code and final output. For commands expected to generate files, also verify the expected artifact exists before reporting its path.",
+      "name": "AwaitShell",
+      "parameters": {
+        "properties": {
+          "block_until_ms": {
+            "description": "Max time to wait before returning, in milliseconds. Defaults to 30000ms. Set to 0 for a non-blocking status check.",
+            "type": "number"
+          },
+          "pattern": {
+            "description": "Regex pattern to match against accumulated stdout/stderr content. Uses multiline matching.",
+            "type": "string"
+          },
+          "shell_id": {
+            "description": "Optional shell id to poll. Required when block_until_ms is 0.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Writes literal characters to an existing background shell session. Use only when a previous Shell result returned a shell_id and the process is waiting for stdin. Include any needed newline in chars.",
+      "name": "WriteShellStdin",
+      "parameters": {
+        "properties": {
+          "chars": {
+            "description": "Literal characters to write to stdin. Include \\n when submitting a line.",
+            "type": "string"
+          },
+          "shell_id": {
+            "description": "The shell_id returned by a backgrounded Shell command.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "shell_id",
+          "chars"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Requests that a running Shell tool call move to the background so the current agent turn can continue. Pass the original Shell tool_call_id, not the shell_id.",
+      "name": "ForceBackgroundShell",
+      "parameters": {
+        "properties": {
+          "tool_call_id": {
+            "description": "The original Shell tool call id to move to background.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_call_id"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Edit an existing text file by replacing exact text copied from the latest Read. Use this as the default tool for modifying existing source, markdown, JSON, YAML, config files, and short inline spans.\n\nUsage:\n- Read the relevant file first, then copy the exact current text into old_string.\n- path must be an absolute file path. Do not pass a relative path, workspace-relative path, or bare filename; this tool will not resolve or rewrite it.\n- old_string must exactly match the current file content; line endings are not normalized or treated equivalently during matching.\n- By default replace_all is false and old_string must match exactly one occurrence. If it matches multiple occurrences, the tool reports an error.\n- Set replace_all to true only when every exact occurrence should be replaced.\n- new_string may be empty to delete old_string.\n- Write is still only for creating new files or intentionally rewriting a whole file.",
+      "name": "PatchEdit",
+      "parameters": {
+        "properties": {
+          "new_string": {
+            "description": "Replacement text. May be empty to delete old_string.",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Exact text to replace. Must match the current file content exactly and must not be empty.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute path to the file to modify. Required forms include /abs/path on macOS/Linux, C:\\abs\\path or C:/abs/path on Windows, or //server/share/path for UNC paths. Relative paths are invalid.",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Whether to replace all exact occurrences. Defaults to false.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Launch a new agent to handle complex, multi-step tasks autonomously.\n\nThe Task tool launches specialized subagents (subprocesses) that autonomously handle complex tasks. Each subagent_type has specific capabilities and tools available to it.\n\nSUBAGENT & DELEGATION POLICY:\nProactively leverage Subagents whenever offloading work provides a concrete benefit in speed, context isolation, or parallelism over running everything in the foreground.\n\nWhen to use Task:\n- Broad Codebase Exploration & Scans: Use subagent_type=\"explore\" or \"generalPurpose\" to search codebase architecture, find API endpoints, trace dependencies, or inspect large sets of files without polluting the main context window.\n- Parallel Execution: When a feature or refactoring naturally splits into decoupled parts (e.g. Frontend vs Backend, multiple modules, unit test creation alongside implementation), launch concurrent subagents in a single batch.\n- Bounded Implementation / Fixes: Dispatch self-contained subtasks (creating new components, writing tests, isolated bug fixes) with clear interface boundaries.\n- Heavy Noise & Log Isolation: Isolate long test traces, terminal outputs, build logs, or extensive diff reviews.\n\nWhen NOT to use the Task tool:\n- Simple, single-file lookups or 1-2 quick edits that can be done immediately.\n- Purely conversational answers.\n\nUsage notes:\n- Always include a short description (3-5 words) summarizing what the agent will do.\n- Provide a clear, structured prompt covering Objective, Scope, Constraints, Expected Output, and Done Criteria.\n- The subagent's outputs should generally be trusted; synthesize concise summaries for the user.\n- Agents can be resumed using the `resume` parameter to reuse existing context.\n\nAvailable subagent_types and a quick description of what they do:\n- generalPurpose: General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks.\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns, search code for keywords, or answer questions about the codebase.\n- shell: Command execution specialist for running bash commands, git operations, and terminal tasks.\n- browser-use: Perform browser-based testing and web automation.\n\nAvailable models:\n- fast: Extremely fast, cost-effective model for quick searches and tightly scoped changes.\n- Default model (unspecified): Inherits parent model for complex multi-step reasoning or high-quality code generation.",
+      "name": "Task",
+      "parameters": {
+        "properties": {
+          "attachments": {
+            "description": "Optional array of file paths to videos to pass to video-review subagents. Files are read and attached to the subagent's context. Supports video formats (mp4, webm) for Gemini models.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "description": "A short (3-5 word) description of the task",
+            "type": "string"
+          },
+          "model": {
+            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)",
+            "enum": [
+              "fast"
+            ],
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The task for the agent to perform",
+            "type": "string"
+          },
+          "readonly": {
+            "description": "If true, the subagent will run in readonly mode (\"Ask mode\") with restricted write operations and no MCP access.",
+            "type": "boolean"
+          },
+          "resume": {
+            "description": "Optional agent ID to resume from. If provided, sends a follow-up message to the agent when its turn is complete.",
+            "type": "string"
+          },
+          "subagent_type": {
+            "description": "Subagent type to use for this task. Must be one of: generalPurpose, explore, shell, browser-use.",
+            "enum": [
+              "generalPurpose",
+              "explore",
+              "shell",
+              "browser-use"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "prompt"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Use this tool to create and manage a structured task list for your current coding session.",
+      "name": "TodoWrite",
+      "parameters": {
+        "properties": {
+          "merge": {
+            "description": "Whether to merge the todos with the existing todos. If true, the todos will be merged into the existing todos based on the id field. Use true for normal incremental updates, marking items complete, adding follow-ups, or changing the current in-progress item. If false, the new todos replace the entire list and must include every existing todo id once a list already exists.",
+            "type": "boolean"
+          },
+          "todos": {
+            "description": "Array of TODO items to update or create",
+            "items": {
+              "properties": {
+                "content": {
+                  "description": "The description/content of the todo item. For merge=true updates, omit content when it is unchanged. New todos and merge=false replacements must include content.",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Unique identifier for the TODO item",
+                  "type": "string"
+                },
+                "status": {
+                  "description": "The current status of the TODO item. For merge=true updates, omit status when it is unchanged.",
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "todos",
+          "merge"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Fetch content from a specified URL and return its contents in a readable markdown format. Use this tool when you need to retrieve and analyze web content.",
+      "name": "WebFetch",
+      "parameters": {
+        "properties": {
+          "url": {
+            "description": "The URL to fetch. The content will be converted to a readable markdown format.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Search web for real-time info on any topic; use for up-to-date facts not in training data, like current events or tech updates. Results include snippets and URLs.",
+      "name": "WebSearch",
+      "parameters": {
+        "properties": {
+          "explanation": {
+            "description": "One sentence explanation as to why this tool is being used, and how it contributes to the goal.",
+            "type": "string"
+          },
+          "search_term": {
+            "description": "The search term to look up on the web. Be specific and include relevant keywords for better results. For technical queries, include version numbers or dates if relevant.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "search_term"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Use this tool to create or revise a concise plan for accomplishing the user's request. It is available in Agent mode when saving or updating a plan in the plan UI would help the user. Use it only when the user requests a persisted plan or when an explicit planning workflow requires it; a textual plan is sufficient otherwise.\n\nThe plan must be concise and actionable. The first line must be a level-1 markdown heading. Do not use markdown tables.\n\nIf a current plan already exists, submit the complete revised plan and omit name. Only the first call may include name.",
+      "name": "CreatePlan",
+      "parameters": {
+        "properties": {
+          "name": {
+            "description": "A short 3-4 word name. Provide only on the first CreatePlan call.",
+            "type": "string"
+          },
+          "overview": {
+            "description": "A 1-2 sentence plan summary.",
+            "type": "string"
+          },
+          "plan": {
+            "description": "The detailed, concrete plan.",
+            "type": "string"
+          },
+          "todos": {
+            "description": "Optional implementation todos.",
+            "items": {
+              "properties": {
+                "content": {
+                  "description": "Description of the todo task.",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Unique todo ID.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Writes a file to the local filesystem.\n\nUsage:\n- path must be an absolute file path. Do not pass a relative path, workspace-relative path, or bare filename; this tool will not resolve or rewrite it.\n- This tool will overwrite the existing file if there is one at the provided path.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.",
+      "name": "Write",
+      "parameters": {
+        "properties": {
+          "contents": {
+            "description": "The contents to write to the file",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute path to the file to modify. Required forms include /abs/path on macOS/Linux, C:\\abs\\path or C:/abs/path on Windows, or //server/share/path for UNC paths. Relative paths are invalid.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "contents"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Generate or display an image using Cursor's native image result flow. Use this when the model already has generated image data to return. The image must be provided as raw base64 in image_data; the backend maps it to Cursor's native GenerateImageResult.success.image_data for display. Do not use markdown images, data URLs, or custom image/file URL protocols.",
+      "name": "GenerateImage",
+      "parameters": {
+        "properties": {
+          "description": {
+            "description": "Optional description of the generated image or the user's image generation intent.",
+            "type": "string"
+          },
+          "file_path": {
+            "description": "Optional target file path if the user explicitly requested one.",
+            "type": "string"
+          },
+          "image_data": {
+            "description": "Raw base64 image data for the generated image. Do not include a data:image/...;base64, prefix.",
+            "type": "string"
+          }
+        },
         "type": "object"
       }
     },

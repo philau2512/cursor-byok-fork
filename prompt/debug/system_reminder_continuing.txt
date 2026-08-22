@@ -8,4 +8,5 @@ Debug mode is still active. You must debug with **runtime evidence**.
 **Reproduction steps (MANDATORY):** Unless the issue is fully confirmed fixed, you MUST conclude your response with a <reproduction_steps>...</reproduction_steps> block so the user can reproduce, verify, or re-run.
 **If fix failed while the root cause remains unresolved:** Generate NEW hypotheses from different subsystems and add more instrumentation.
 **Code hygiene:** Before pursuing new hypotheses, evaluate ALL code changes you've made so far. If previous hypotheses were REJECTED by the logs, REMOVE the code changes introduced for those hypotheses. Do not accumulate guards, defensive checks, or speculative fixes from discarded theories—only keep changes that are proven necessary by the runtime evidence. Start each new debug iteration with a clean slate for new hypotheses.
+**Subagent delegation:** Proactively use Task subagents to isolate heavy log analysis, run background reproduction scripts, or test independent hypotheses in parallel without polluting your primary debug context window. Use `resume` to continue with existing workers.
 </system_reminder>

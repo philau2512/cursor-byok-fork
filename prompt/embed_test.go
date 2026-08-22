@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,11 @@ func TestCommonPrefixAllowsHybridSingleSubagentDelegation(t *testing.T) {
 		"follow-up can reuse its large task context",
 		"materially reduces the primary agent's context growth",
 		"Do not delegate simple lookups",
+		"Structured Task Prompt Format",
+		"Staged Execution (Phased Pipelines)",
+		"Parent Integration Verification Gate",
+		"Handling BLOCKED or PARTIAL Outcomes",
+		"resume:",
 	} {
 		if !strings.Contains(string(text), required) {
 			t.Fatalf("common prefix missing subagent policy %q", required)
@@ -88,12 +94,119 @@ func TestAskPromptContractForbidsMutations(t *testing.T) {
 		t.Fatalf("ReadPrompt(ask): %v", err)
 	}
 	for _, required := range []string{
-		"你绝对不能进行任何编辑",
-		"运行任何非只读工具",
-		"你绝不能亲自实现",
+		"must not make any edits",
+		"run any non-read-only tools",
+		"must not implement it yourself",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("Ask prompt missing contract %q", required)
 		}
 	}
 }
+
+func TestAllToolCatalogsAreValidJSONAndConsistent(t *testing.T) {
+	for _, mode := range []Mode{ModeAgent, ModeAsk, ModePlan, ModeDebug, ModeMultitask, ModeSubagent} {
+		raw, err := ReadTools(mode)
+		if err != nil {
+			t.Fatalf("ReadTools(%s): %v", mode, err)
+		}
+		var tools []struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				Parameters  map[string]any `json:"parameters"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tools); err != nil {
+			t.Fatalf("Unmarshal tools for mode %s: %v", mode, err)
+		}
+		if len(tools) == 0 {
+			t.Fatalf("tools for mode %s is empty", mode)
+		}
+		for _, tool := range tools {
+			if tool.Function.Name == "" {
+				t.Fatalf("tool in mode %s has empty function name", mode)
+			}
+			if tool.Function.Description == "" {
+				t.Fatalf("tool %s in mode %s has empty description", tool.Function.Name, mode)
+			}
+		}
+	}
+}
+
+func TestSubagentPromptContainsHandoffContractAndSafetyGuidelines(t *testing.T) {
+	text, err := ReadPrompt(ModeSubagent)
+	if err != nil {
+		t.Fatalf("ReadPrompt(subagent): %v", err)
+	}
+	for _, required := range []string{
+		"<handoff_return_contract>",
+		"**Status**",
+		"**Changes / Findings**",
+		"**Evidence & Verification**",
+		"# Editing constraints",
+		"# Tool & Terminal guidelines",
+		"Never touch files outside your delegated task",
+		"Prefer native tools",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Subagent prompt missing contract or safety guideline %q", required)
+		}
+	}
+}
+
+func TestDebugPromptAndReminderContainSubagentPolicy(t *testing.T) {
+	reminder, err := ReadDebugSystemReminder(true)
+	if err != nil {
+		t.Fatalf("ReadDebugSystemReminder(true): %v", err)
+	}
+	for _, required := range []string{
+		"<subagent_delegation_in_debug_mode>",
+		"Heavy Noise & Log Trace Isolation",
+		"Parallel Hypothesis Testing",
+		"Context Reuse",
+	} {
+		if !strings.Contains(reminder, required) {
+			t.Fatalf("Debug system reminder missing subagent policy %q", required)
+		}
+	}
+
+	continuingReminder, err := ReadDebugSystemReminder(false)
+	if err != nil {
+		t.Fatalf("ReadDebugSystemReminder(false): %v", err)
+	}
+	if !strings.Contains(continuingReminder, "Subagent delegation") {
+		t.Fatalf("Debug continuing reminder missing subagent delegation note")
+	}
+}
+
+func TestSubagentToolsCatalogSchema(t *testing.T) {
+	raw, err := ReadTools(ModeSubagent)
+	if err != nil {
+		t.Fatalf("ReadTools(subagent): %v", err)
+	}
+	var tools []struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		t.Fatalf("Unmarshal subagent tools: %v", err)
+	}
+	toolNames := make(map[string]bool)
+	for _, tool := range tools {
+		toolNames[tool.Function.Name] = true
+	}
+	for _, required := range []string{"PatchEdit", "Write", "Delete", "Shell", "Glob", "Grep", "Read", "Ls", "ReadLints", "Task"} {
+		if !toolNames[required] {
+			t.Fatalf("subagent tools.json missing expected tool %q", required)
+		}
+	}
+	for _, disallowed := range []string{"AskQuestion", "SwitchMode"} {
+		if toolNames[disallowed] {
+			t.Fatalf("subagent tools.json unexpectedly contains disallowed tool %q", disallowed)
+		}
+	}
+}
+
