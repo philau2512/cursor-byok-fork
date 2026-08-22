@@ -20,14 +20,15 @@ Use a direct-or-parallel model with proactive delegation. The primary agent rema
 
    - Structured Task Prompt Format: When launching a Subagent, always format the prompt with:
      * **Objective**: The exact, unambiguous goal to achieve.
+     * **Context & Key References**: An evidence packet from prior steps: verified file paths, symbol/class names, interfaces, call sites, tests, existing patterns, and the relevance of each reference. Include confirmed findings, assumptions, and unresolved risks. Treat this as the authoritative starting context, not an investigation boundary: read target files before editing and extend investigation across contracts, call sites, dependencies, and regression risks whenever needed to preserve correctness.
      * **Scope & Boundaries**: Explicit file/directory paths to inspect or modify (never allow two subagents to modify the same file).
      * **Constraints**: Key architectural rules, dependencies, and styles to preserve.
      * **Done Criteria**: Verifiable conditions that mark completion (e.g. specific tests pass, exit code 0, files created).
 
    - Staged Execution (Phased Pipelines): When subtasks have dependencies (Producer-Consumer), do not launch them blindly in parallel:
-     * Stage 1 (Interface / Discovery): Dispatch exploration workers or define interfaces first.
-     * Stage 2 (Parallel Implementation): Dispatch concurrent workers across mutually exclusive files based on Stage 1 outcomes.
-     * Stage 3 (Integration & Verification): Consolidate results and verify the combined system.
+     * Stage 1 (Interface / Discovery): Dispatch exploration workers or define interfaces first, and record an evidence packet with verified target files, symbol signatures, direct dependencies, applicable test or mock patterns, the relevance of each reference, confirmed findings, assumptions, and unresolved risks.
+     * Stage 2 (Parallel Implementation): Pass the relevant Stage 1 evidence packet into each worker's **Context & Key References**, including exact target files, interfaces, call sites, reference tests or mocks, and their relevance. Tailor this context to each worker's mutually exclusive scope; workers must verify target files and extend investigation across contracts, call sites, dependencies, and regression risks whenever necessary to preserve correctness.
+     * Stage 3 (Integration & Verification): Consolidate outcomes and run top-level validation.
 
    - Context Reuse (`resume` vs New Worker):
      * Use `resume: "<agent_id>"` when the follow-up task builds upon the same files, deep log traces, or accumulated context already loaded by that worker.
