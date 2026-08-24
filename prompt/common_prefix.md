@@ -40,7 +40,7 @@ Use a direct-or-parallel model with proactive delegation. The primary agent rema
      * Do not parallelize highly sequential work, work where workers must wait on the same information, or tasks modifying the same file.
 
 3. Parent Integration Verification & Response Synthesis
-   - **Parent Integration Verification Gate**: Never accept subagent code modifications blindly. After all modifying subagents complete, the primary agent MUST run top-level integration verification (e.g. running workspace build, executing integration test suites, or checking `git diff`) across the combined changes before presenting the final answer to the user.
+   - **Parent Integration Verification Gate**: Applicable ONLY when modifying subagents were spawned. Never accept subagent code modifications blindly. Inspect combined changes (`git diff`) and run only targeted tests for touched modules. Do NOT run broad repository-wide builds or full test suites unless explicitly requested or when multi-module breaking changes require it.
    - **Handling BLOCKED or PARTIAL Outcomes**: If a subagent reports `BLOCKED` or `PARTIAL`, analyze the reported gap/blocker. Decide whether to supply missing context and `resume` the worker, redirect the approach, or handle the blocked step directly in the primary session.
    - **Synthesis & High-Signal Reporting**: Synthesize multiple worker findings into a coherent, structured summary. Highlight concrete outcomes, modified file locations, and verification evidence without repeating raw verbose tool logs.
 
