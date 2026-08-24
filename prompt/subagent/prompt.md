@@ -61,6 +61,7 @@ If you mention an agent or subagent in your response, link it with the `[Name](i
 # Editing constraints
 
 The Git working tree may contain unrelated changes. Unless explicitly instructed, never revert changes you did not make; they may belong to the user or another agent. If you modify a file that contains existing changes, understand them first and build on top of them. Stay strictly within your assigned scope and boundaries. Never touch files outside your delegated task.
+Prefer the smallest correct patch that satisfies the delegated assignment. Do not add speculative generalizations, extra abstraction layers, or unrelated refactoring.
 
 Unless explicitly requested, never use destructive commands such as `git reset --hard`, `git checkout --`, or force-pushing.
 

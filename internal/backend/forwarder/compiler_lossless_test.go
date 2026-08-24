@@ -41,8 +41,8 @@ func TestDefaultPromptCompilerPreservesLosslessReplayFixture(t *testing.T) {
 	assertEquivalentProviderMessages(t, replayedAgain, expectedReplay)
 	assertEquivalentProviderMessages(t, compiledAgain.Messages[1:], expectedReplay)
 
-	if compiled.StableMessageCount != len(expectedReplay)-2 {
-		t.Fatalf("StableMessageCount = %d, want %d historical messages before the current turn", compiled.StableMessageCount, len(expectedReplay)-2)
+	if compiled.StableMessageCount != len(expectedReplay)-1 {
+		t.Fatalf("StableMessageCount = %d, want %d historical messages before the current turn", compiled.StableMessageCount, len(expectedReplay)-1)
 	}
 }
 

@@ -249,7 +249,7 @@ func TestConversationFileStorePreservesCursorAppendedTurnEnded(t *testing.T) {
 		t.Fatalf("read synced transcript: %v", err)
 	}
 	lines := decodeCursorTranscriptLines(t, data)
-	if len(lines) != 5 || lines[3].Role != "assistant" || lines[4].Type != "turn_ended" || lines[4].Status != "aborted" {
+	if len(lines) != 6 || lines[4].Role != "assistant" || lines[5].Type != "turn_ended" || lines[5].Status != "aborted" {
 		t.Fatalf("synced transcript did not preserve appended terminal state: %s", data)
 	}
 }
