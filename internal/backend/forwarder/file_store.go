@@ -498,10 +498,25 @@ func conversationTranscriptSyncReady(conversation *ConversationFile) bool {
 	}
 	switch strings.TrimSpace(conversation.CurrentLoopStatus) {
 	case "running", "waiting_tool", "checkpointing":
-		return false
+		return conversationHasCompletedTurnBefore(conversation.Entries, conversation.CurrentTurnSeq)
 	default:
 		return true
 	}
+}
+
+func conversationHasCompletedTurnBefore(entries []HistoryEntry, currentTurnSeq int64) bool {
+	if currentTurnSeq <= 0 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.TurnSeq <= 0 || entry.TurnSeq >= currentTurnSeq {
+			continue
+		}
+		if _, ok := cursorTranscriptTurnStatus(entry); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (store *ConversationFileStore) syncCursorTranscriptBestEffort(conversationID string, conversation *ConversationFile) {
