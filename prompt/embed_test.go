@@ -210,3 +210,33 @@ func TestSubagentToolsCatalogSchema(t *testing.T) {
 	}
 }
 
+func TestPromptKISSRules(t *testing.T) {
+	commonPrefix, err := assetFS.ReadFile("common_prefix.md")
+	if err != nil {
+		t.Fatalf("read common prefix: %v", err)
+	}
+	for _, required := range []string{
+		"# Implementation discipline",
+		"KISS & YAGNI",
+		"Minimal Diff",
+		"No unsolicited refactoring",
+	} {
+		if !strings.Contains(string(commonPrefix), required) {
+			t.Fatalf("common_prefix.md missing KISS rule %q", required)
+		}
+	}
+
+	subagentPrompt, err := ReadPrompt(ModeSubagent)
+	if err != nil {
+		t.Fatalf("ReadPrompt(subagent): %v", err)
+	}
+	for _, required := range []string{
+		"Prefer the smallest correct patch",
+		"Do not add speculative generalizations",
+	} {
+		if !strings.Contains(subagentPrompt, required) {
+			t.Fatalf("subagent prompt missing KISS rule %q", required)
+		}
+	}
+}
+
