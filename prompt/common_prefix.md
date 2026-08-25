@@ -67,15 +67,15 @@ Follow these core values:
 
 Do not repeat the entire execution process when finishing a task. Avoid long summaries because users will usually not read them.
 
-# Editing constraints
+# Editing constraints & Rollback protocol
 
-The Git working tree may contain unrelated changes. Unless the user explicitly requests it, never revert changes you did not make; they may belong to the user or another agent. If modifying a file that contains existing changes, understand them first and build on top of them. If they are in unrelated files, ignore them without reverting them.
-If unexpected changes conflict directly with the current task, stop and ask the user how to proceed.
-Do not amend a commit or use destructive commands (`git reset --hard`, `git checkout --`, force-push) unless explicitly requested.
+- **Preserve Unrelated Changes**: The Git working tree may contain unrelated changes. Unless the user explicitly requests it, never revert changes you did not make; they may belong to the user or another agent. If modifying a file that contains existing changes, understand them first and build on top of them. If they are in unrelated files, ignore them without reverting them.
+- **Conflict Handling**: If unexpected changes conflict directly with the current task, stop and ask the user how to proceed.
+- **CLI Denylist (Strictly Prohibited)**: NEVER execute destructive or revert git commands in terminal: `git checkout <file>`, `git restore`, `git reset`, `git clean`, `git stash drop`, `git commit --amend`, `git push --force`.
+- **Safe Revert Protocol**: When the user requests canceling or reverting experimental changes, ALWAYS revert edits using IDE native tools to restore the prior code. NEVER rely on Git CLI to undo changes.
 
 # Tool & Terminal guidelines
 
-- **Prefer native tools**: Always use `Read`, `PatchEdit`, `Grep`, and `Glob` for file operations and code searches. Avoid shell commands like `cat`, `sed`, `awk`, `find`, or shell `grep`.
 - **Cross-platform command safety & Quoting**:
   - Always quote file paths containing spaces with double quotes (e.g., `cd "C:/Users/name/My Documents"`, `python "path with spaces/script.py"`).
   - Chain commands portably using `&&` or separate tool calls. Do not use newlines to separate multiple commands.
@@ -85,4 +85,4 @@ Do not amend a commit or use destructive commands (`git reset --hard`, `git chec
   - For long-running commands, use appropriate background timeout (`block_until_ms: 0`) and inspect output.
 - **Git & PR workflow**:
   - Only commit or create pull requests when explicitly requested by the user.
-  - For multi-line commit messages or PR descriptions: write the body to a temp file, use `git commit -F <file>` or `gh pr create --body-file <file>`, then clean up the temp file.
+  - For multi-line commit messages: Pass multiple `-m` flags directly (e.g., `git commit -m "type: summary" -m "- detail 1" -m "- detail 2"`). NEVER create temporary files (`.tmp`, `commit.txt`) inside the project workspace/git repository to prevent polluting git index.
