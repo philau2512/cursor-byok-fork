@@ -145,7 +145,7 @@
     },
     {
       "function": {
-        "description": "\nTool to search for files matching a glob pattern\n\n- Works fast with codebases of any size\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches that are potentially useful as a batch.\n",
+        "description": "\nTool to search for files matching a glob pattern\n\n- Works fast with codebases of any size\n- Returns matching file paths sorted by modification time\n- Primary tool for exploring directory trees: use target_directory and glob_pattern (e.g. \"**/*\") to inspect the full recursive file tree or understand the deep nested structure of a directory or module in a single call.\n- Use this tool when you need to find files by name patterns, extensions, or directory hierarchies.\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches that are potentially useful as a batch.\n",
         "name": "Glob",
         "parameters": {
           "properties": {
@@ -265,7 +265,7 @@
     },
     {
       "function": {
-        "description": "Lists files and directories under a directory path.\n\nUse this tool when you need directory structure, especially top-level project layout or immediate children of a folder. Do not use Glob(\"*\") or recursive Glob patterns to list a directory; use Ls instead.\n\nYou may provide ignore globs for large or irrelevant directories such as .git, node_modules, dist, build, .cursor-local-assistant-v2/history, or logs.",
+        "description": "Lists files and directories under a directory path.\n\nUse this tool only when you need immediate children (1 level) of a directory without recursion.\nWhen you need to view the full recursive file tree or understand the deep nested structure of a directory or module, prefer Glob with a recursive pattern (e.g. target_directory: \"path/to/dir\", glob_pattern: \"**/*\") instead of issuing repetitive Ls calls on every subfolder.\n\nYou may provide ignore globs for large or irrelevant directories such as .git, node_modules, dist, build, .cursor-local-assistant-v2/history, or logs.",
         "name": "Ls",
         "parameters": {
           "properties": {
@@ -467,7 +467,7 @@
     },
     {
       "function": {
-        "description": "Switch the interaction mode to better match the current task. Each mode is optimized for a specific type of work.\n\n## When to Switch Modes\n\nSwitch modes proactively when:\n1. **Task type changes** - User shifts from asking questions to requesting implementation, or vice versa\n2. **Complexity emerges** - What seemed simple reveals architectural decisions or multiple approaches\n3. **Debugging needed** - An error, bug, or unexpected behavior requires investigation\n4. **Planning needed** - The task is large, ambiguous, or has significant trade-offs to discuss\n5. **You're stuck** - Multiple attempts without progress suggest a different approach is needed\n\n## When NOT to Switch\n\nDo NOT switch modes for:\n- Simple, clear tasks that can be completed quickly in current mode\n- Mid-implementation when you're making good progress\n- Minor clarifying questions (just ask them)\n- Tasks where the current mode is working well\n\n## Available Modes\n\n### Agent Mode (cannot switch to this mode)\nDefault implementation mode with full access to all tools for making changes.\n\n### Plan Mode [switchable]\nInvestigation-first collaborative mode for designing implementation approaches. It may create a minimal workspace planning artifact only when the user explicitly requests one.\n\n**Switch to Plan when:**\n- The task has multiple valid approaches with significant trade-offs\n- Architectural decisions are needed (e.g., \"Add caching\" - Redis vs in-memory vs file-based)\n- The task touches many files or systems (large refactors, migrations)\n- Requirements are unclear and you need to explore before understanding scope\n- You would otherwise ask multiple clarifying questions\n\n**Examples:**\n- User: \"Add user authentication\" → Switch to Plan (session vs JWT, storage, middleware decisions)\n- User: \"Refactor the database layer\" → Switch to Plan (large scope, architectural impact)\n- User: \"Make the app faster\" → Switch to Plan (need to profile, multiple optimization strategies)\n\n### Debug Mode (cannot switch to this mode)\nSystematic troubleshooting mode for investigating bugs, failures, and unexpected behavior with runtime evidence.\n\n### Ask Mode (cannot switch to this mode)\nRead-only mode for exploring code and answering questions without making changes.\n\n## Important Notes\n\n- **Be proactive**: Don't wait for the user to ask you to switch modes\n- **Explain briefly**: When switching, briefly explain why in your `explanation` parameter\n- **Don't over-switch**: If the current mode is working, stay in it\n- **User approval required**: Mode switches require user consent",
+        "description": "Switch the interaction mode to better match the current task. Each mode is optimized for a specific type of work.\n\n## When to Switch Modes\n\nSwitch modes proactively when:\n1. **Task type changes** - User shifts from asking questions to requesting implementation, or vice versa\n2. **Complexity emerges** - What seemed simple reveals architectural decisions or multiple approaches\n3. **Debugging needed** - An error, bug, or unexpected behavior requires investigation\n4. **Planning needed** - The task is large, ambiguous, or has significant trade-offs to discuss\n5. **You're stuck** - Multiple attempts without progress suggest a different approach is needed\n\n## When NOT to Switch\n\nDo NOT switch modes for:\n- Simple, clear tasks that can be completed quickly in current mode\n- Mid-implementation when you're making good progress\n- Minor clarifying questions (just ask them)\n- Tasks where the current mode is working well\n\n## Available Modes\n\n### Agent Mode [switchable]\nDefault implementation mode with full access to all tools for making changes.\n\n**Switch to Agent when:**\n- You have a clear understanding of what to implement\n- Planning/debugging is complete and you're ready to code\n- The task is straightforward with an obvious implementation\n- You've gathered enough context and are ready to execute\n\n**Examples:**\n- After planning: \"I've designed the approach, ready to implement\" -> Switch to Agent\n- After debugging: \"Found the bug, it's a null check issue\" -> Switch to Agent\n- Simple task: User asks to \"Add a comment to this function\" -> Stay in Agent (no switch needed)\n\n### Plan Mode [switchable]\nInvestigation-first collaborative mode for designing implementation approaches. It may create a minimal workspace planning artifact only when the user explicitly requests one.\n\n**Switch to Plan when:**\n- The task has multiple valid approaches with significant trade-offs\n- Architectural decisions are needed (e.g., \"Add caching\" - Redis vs in-memory vs file-based)\n- The task touches many files or systems (large refactors, migrations)\n- Requirements are unclear and you need to explore before understanding scope\n- You would otherwise ask multiple clarifying questions\n\n**Examples:**\n- User: \"Add user authentication\" -> Switch to Plan (session vs JWT, storage, middleware decisions)\n- User: \"Refactor the database layer\" -> Switch to Plan (large scope, architectural impact)\n- User: \"Make the app faster\" -> Switch to Plan (need to profile, multiple optimization strategies)\n\n### Debug Mode (cannot switch to this mode)\nSystematic troubleshooting mode for investigating bugs, failures, and unexpected behavior with runtime evidence.\n\n### Ask Mode (cannot switch to this mode)\nRead-only mode for exploring code and answering questions without making changes.\n\n## Important Notes\n\n- **Be proactive**: Don't wait for the user to ask you to switch modes\n- **Explain briefly**: When switching, briefly explain why in your `explanation` parameter\n- **Don't over-switch**: If the current mode is working, stay in it\n- **User approval required**: Mode switches require user consent",
         "name": "SwitchMode",
         "parameters": {
           "properties": {
@@ -476,7 +476,7 @@
               "type": "string"
             },
             "target_mode_id": {
-              "description": "The mode to switch to. Allowed values: 'plan'.",
+              "description": "The mode to switch to. Allowed values: 'plan', 'agent'.",
               "type": "string"
             }
           },
@@ -639,32 +639,32 @@
     },
     {
       "function": {
-        "description": "Use this tool to create or revise a concise plan for accomplishing the user's request. It is available in Agent mode when saving or updating a plan in the plan UI would help the user. Use it only when the user requests a persisted plan or when an explicit planning workflow requires it; a textual plan is sufficient otherwise.\n\nThe plan must be concise and actionable. The first line must be a level-1 markdown heading. Do not use markdown tables.\n\nIf a current plan already exists, submit the complete revised plan and omit name. Only the first call may include name.",
+        "description": "Use this tool to create or revise a concise plan for accomplishing the user's request. It is available when saving or updating a plan in the plan UI would help the user. Use it only when the user requests a persisted plan or when an explicit planning workflow requires it; a textual plan is sufficient otherwise.\n\nThe plan you create should be properly formatted in markdown, using appropriate sections and headers. The plan should be very concise and actionable, providing the minimum amount of detail for the user to understand and action the plan. Cite specific file paths and essential snippets of code. IMPORTANT: Do NOT use markdown tables in plan content (they cannot be rendered for the user); use bullet lists instead. The first line MUST BE A TITLE for the plan formatted as a level 1 markdown heading.\n\nTASK ORGANIZATION:\n\nUse 'todos' for organizing implementation tasks:\n- Each todo should be a clear, specific, and actionable task\n- Each todo needs a unique ID (e.g., \"setup-auth\") and descriptive content\n- If the plan is simple, provide just a few high-level todos or none at all\n\nUPDATING THE PLAN:\n- If a current plan already exists, submit the complete revised plan and omit the name field\n- Only the first CreatePlan call may include name; later calls must not include name and must not use name to rename or create a separate plan\n\nAdditional guidelines:\n- Avoid asking clarifying questions in the plan itself. Ask them before calling this tool using the AskQuestion tool.\n- Todos help break down complex plans into manageable, trackable tasks\n- Focus on high-level meaningful decisions rather than low-level implementation details\n- A good plan is glanceable, not a wall of text.",
         "name": "CreatePlan",
         "parameters": {
           "properties": {
             "name": {
-              "description": "A short 3-4 word name. Provide only on the first CreatePlan call.",
+              "description": "A short 3-4 word name for the plan. IMPORTANT: Provide this only on the first CreatePlan call when no current plan exists. If a current plan already exists, omit this field entirely; do not use it to rename or create a separate plan.",
               "type": "string"
             },
             "overview": {
-              "description": "A 1-2 sentence plan summary.",
+              "description": "A 1-2 sentence high-level description of the plan that summarizes what will be accomplished",
               "type": "string"
             },
             "plan": {
-              "description": "The detailed, concrete plan.",
+              "description": "A detailed, concrete plan for accomplishing the user's request",
               "type": "string"
             },
             "todos": {
-              "description": "Optional implementation todos.",
+              "description": "Array of implementation todos",
               "items": {
                 "properties": {
                   "content": {
-                    "description": "Description of the todo task.",
+                    "description": "Description of the todo task",
                     "type": "string"
                   },
                   "id": {
-                    "description": "Unique todo ID.",
+                    "description": "Unique identifier for the todo",
                     "type": "string"
                   }
                 },
@@ -708,23 +708,44 @@
     },
     {
       "function": {
-        "description": "Generate or display an image using Cursor's native image result flow. Use this when the model already has generated image data to return. The image must be provided as raw base64 in image_data; the backend maps it to Cursor's native GenerateImageResult.success.image_data for display. Do not use markdown images, data URLs, or custom image/file URL protocols.",
+        "description": "Generate an image file from a text description.\n\nSTRICT INVOCATION RULES (must follow):\n- Only use this tool when the user explicitly asks for an image. Do not generate images \"just to be helpful\".\n- Do not use this tool for data heavy visualizations such as charts, plots, tables.\n\nGeneral guidelines:\n- Provide a concrete description first: subject(s), layout, style, colors, text (if any), and constraints.\n- If the user requests an aspect ratio, set `aspect_ratio` to one of \"1:1\", \"4:3\", \"3:4\", \"16:9\", or \"9:16\".\n- If the user provides reference images, include them in `reference_image_paths`.\n- Do not repeat generated images as Markdown in your response; the client displays tool-generated images automatically.\n\nExamples that should call this tool:\n- user: \"Generate an app icon for a note-taking app, minimal flat vector style.\" (explicitly requests an image asset)\n- user: \"Make a UI mockup of a settings screen with a dark mode toggle.\" (explicitly requests a UI mockup)\n- user: \"Generate an asset of a game character with a sword.\" (explicitly requests a visual asset)\n\nExamples that should not call this tool:\n- user: \"Create a plan to refactor this module.\" (planning request; respond in text or mermaid diagram)\n- user: \"Generate a chart of sales and revenue using data.csv.\" (data visualization; generate via code)",
         "name": "GenerateImage",
         "parameters": {
           "properties": {
-            "description": {
-              "description": "Optional description of the generated image or the user's image generation intent.",
+            "aspect_ratio": {
+              "description": "Optional aspect ratio for the generated image. Supported values are \"1:1\", \"4:3\", \"3:4\", \"16:9\", and \"9:16\".",
+              "enum": [
+                "1:1",
+                "4:3",
+                "3:4",
+                "16:9",
+                "9:16"
+              ],
               "type": "string"
             },
-            "file_path": {
-              "description": "Optional target file path if the user explicitly requested one.",
+            "description": {
+              "description": "A detailed description of the image to generate.",
+              "type": "string"
+            },
+            "filename": {
+              "description": "Optional filename for the generated image (e.g., 'diagram.png'). Do not include a directory path - the tool automatically handles where to save and how to display the image. If not provided, a timestamped filename will be generated.",
               "type": "string"
             },
             "image_data": {
-              "description": "Raw base64 image data for the generated image. Do not include a data:image/...;base64, prefix.",
+              "description": "Optional raw base64 image data if the model directly produced image bytes. Do not include data:image/...;base64, prefix.",
               "type": "string"
+            },
+            "reference_image_paths": {
+              "description": "Optional array of file paths to reference images as additional inputs.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
+          "required": [
+            "description"
+          ],
           "type": "object"
         }
       },
