@@ -11,6 +11,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -2998,10 +2999,19 @@ func DecodeGrepToolArgs(raw []byte, toolCallID string) (*agentv1.GrepArgs, error
 	if err != nil {
 		return nil, err
 	}
+	rawPattern := strings.TrimSpace(readStringArg(args, "pattern"))
+	rawPath := strings.TrimSpace(readStringArg(args, "path"))
+	if rawPath != "" {
+		rawPath = filepath.Clean(rawPath)
+	}
+	rawGlob := strings.TrimSpace(readStringArg(args, "glob"))
+	if rawGlob != "" {
+		rawGlob = strings.ReplaceAll(rawGlob, "\\", "/")
+	}
 	result := &agentv1.GrepArgs{
-		Pattern:    strings.TrimSpace(readStringArg(args, "pattern")),
-		Path:       stringPtr(strings.TrimSpace(readStringArg(args, "path"))),
-		Glob:       stringPtr(strings.TrimSpace(readStringArg(args, "glob"))),
+		Pattern:    rawPattern,
+		Path:       stringPtrIfNonEmpty(rawPath),
+		Glob:       stringPtrIfNonEmpty(rawGlob),
 		OutputMode: stringPtr(strings.TrimSpace(readStringArg(args, "output_mode", "outputMode"))),
 		Type:       stringPtr(strings.TrimSpace(readStringArg(args, "type"))),
 		ToolCallId: strings.TrimSpace(toolCallID),
