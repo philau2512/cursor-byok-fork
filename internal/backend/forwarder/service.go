@@ -328,32 +328,6 @@ func (service *Service) Close(ctx context.Context) error {
 	return service.usageStore.Close(ctx)
 }
 
-// newServiceWithDependencies 主要用于测试场景，允许注入替身依赖。
-func newServiceWithDependencies(store *ConversationFileStore, projector *HistoryProjector, compiler PromptCompiler, provider ProviderGateway, broker *StreamBroker) *Service {
-	historyRoot := ""
-	if store != nil {
-		historyRoot = store.HistoryDir()
-	}
-	debug := newDebugRecorder(historyRoot, broker, nil)
-	return &Service{
-		store:              store,
-		contentBlobs:       NewContentBlobStore(historyRoot),
-		rules:              NewUserRuleStore(appdata.RulesRootPath()),
-		projector:          projector,
-		compiler:           compiler,
-		provider:           provider,
-		broker:             broker,
-		usageStore:         NewUsageFileStore(store.HistoryDir()),
-		codebaseIndexStore: NewCodebaseIndexStore(appdata.CodebaseIndexRootPath()),
-		docsIndexStore:     NewDocsIndexStore(appdata.DocsIndexRootPath()),
-		recorder:           newArtifactRecorder(store, broker, debug),
-		debug:              debug,
-		execBridge:         execbridge.NewBridge(),
-		interactionBridge:  interactionbridge.NewBridge(),
-		appendSeq:          newAppendSequenceTracker(),
-	}
-}
-
 // BidiAppend 处理 legacy Bidi 上行，把用户输入和外部结果归一化后写入 history。
 func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[aiserverv1.BidiAppendRequest]) (*connect.Response[aiserverv1.BidiAppendResponse], error) {
 	if service == nil {
@@ -959,24 +933,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		return nil
 	}
 	return service.requestProviderAction(stream, providerActionStart)
-}
-
-func (service *Service) loadPreviousSummaryReplay(conversationID string) ([][]byte, bool, error) {
-	if service == nil || strings.TrimSpace(conversationID) == "" {
-		return nil, false, nil
-	}
-	return service.loadLatestCarryForwardReplay(conversationID)
-}
-
-func (service *Service) snapshotVisibleTurns(conversation *ConversationFile) ([][]byte, error) {
-	if service == nil || service.projector == nil || conversation == nil {
-		return nil, nil
-	}
-	state, err := service.projector.ProjectLegacyCheckpoint(conversation)
-	if err != nil {
-		return nil, err
-	}
-	return cloneByteSlices(state.GetTurns()), nil
 }
 
 // handleCancelIntent 处理取消请求，并向客户端发送执行桥 abort。
@@ -1585,9 +1541,7 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	return nil
 }
 
-func (service *Service) scheduleProviderResume(stream *ActiveStream, _ int) error {
-	return service.requestProviderAction(stream, providerActionResume)
-}
+
 
 func shouldResumeAfterToolResults(finishReason string) bool {
 	switch strings.TrimSpace(finishReason) {
@@ -1598,12 +1552,7 @@ func shouldResumeAfterToolResults(finishReason string) bool {
 	}
 }
 
-func (service *Service) cancelScheduledProviderResume(stream *ActiveStream) {
-	if stream == nil {
-		return
-	}
-	clearStreamTimer(stream, providerTimerKey(streamTimerProviderResume, ""))
-}
+
 
 // driveProvider 由 actor 触发一次 provider pass，并把真实流包装成 provider_event 回投 mailbox。
 func (service *Service) driveProvider(stream *ActiveStream) error {
@@ -2441,20 +2390,7 @@ func (service *Service) closeStreamWithProviderError(
 	return service.failActiveStream(stream, conversationID, requestID, modelCallID, "provider_error", errorText)
 }
 
-func takePendingProviderCompletion(stream *ActiveStream) (pendingTurnCompletion, bool) {
-	if stream == nil {
-		return pendingTurnCompletion{}, false
-	}
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	if stream.PendingProviderCompletion == nil {
-		return pendingTurnCompletion{}, false
-	}
-	completion := *stream.PendingProviderCompletion
-	stream.PendingProviderCompletion = nil
-	stream.UpdatedAt = time.Now().UTC()
-	return completion, true
-}
+
 
 func pendingBridgeCount(stream *ActiveStream) int {
 	if stream == nil {
@@ -2465,34 +2401,7 @@ func pendingBridgeCount(stream *ActiveStream) int {
 	return len(stream.PendingExecs) + len(stream.PendingInteractions)
 }
 
-func (service *Service) finishDeferredTurnAfterInteraction(stream *ActiveStream, pending runtimecore.PendingInteraction) error {
-	completion, ok := takePendingProviderCompletion(stream)
-	if !ok {
-		stream.mu.Lock()
-		completion = pendingTurnCompletion{
-			ConversationID: stream.ConversationID,
-			RequestID:      stream.RequestID,
-			TurnSeq:        stream.TurnSeq,
-			ModelCallID:    firstNonEmpty(strings.TrimSpace(pending.ModelCallID), strings.TrimSpace(stream.CurrentModelCallID)),
-			ProviderPass:   pending.ProviderPass,
-		}
-		stream.mu.Unlock()
-		log.Printf(
-			"forwarder missing deferred turn completion snapshot request_id=%s tool_call_id=%s interaction_kind=%s provider_pass=%d",
-			strings.TrimSpace(completion.RequestID),
-			strings.TrimSpace(pending.ToolCallID),
-			strings.TrimSpace(pending.InteractionKind),
-			pending.ProviderPass,
-		)
-	}
-	if strings.TrimSpace(completion.ModelCallID) == "" {
-		completion.ModelCallID = strings.TrimSpace(pending.ModelCallID)
-	}
-	if completion.ProviderPass == 0 {
-		completion.ProviderPass = pending.ProviderPass
-	}
-	return service.completeSuccessfulTurn(stream, completion)
-}
+
 
 func (service *Service) completeSuccessfulTurn(stream *ActiveStream, completion pendingTurnCompletion) error {
 	if stream == nil {
@@ -3918,16 +3827,7 @@ func readStringAny(value any) string {
 	return strings.TrimSpace(text)
 }
 
-func readMapAny(value any) map[string]any {
-	switch item := value.(type) {
-	case map[string]any:
-		return item
-	case nil:
-		return map[string]any{}
-	default:
-		return map[string]any{}
-	}
-}
+
 
 // inferToolName 从完整 ToolCall proto 中反推出 canonical 工具名。
 func inferToolName(toolCall *agentv1.ToolCall) string {
@@ -4020,42 +3920,7 @@ func deriveToolNameFromPendingExec(pending runtimecore.PendingExec) string {
 	}
 }
 
-func execKindFromToolName(name string) (string, bool) {
-	switch strings.TrimSpace(name) {
-	case "Read":
-		return "read", true
-	case "Write":
-		return "write", true
-	case "PatchEdit":
-		return "patch_edit", true
-	case "Delete":
-		return "delete", true
-	case "Glob":
-		return "glob", true
-	case "Grep":
-		return "grep", true
-	case "Ls":
-		return "ls", true
-	case "ReadLints":
-		return "diagnostics", true
-	case "CallMcpTool":
-		return "mcp", true
-	case "FetchMcpResource":
-		return "read_mcp_resource", true
-	case "Shell":
-		return "shell", true
-	case "AwaitShell":
-		return "await_shell", true
-	case "WriteShellStdin":
-		return "write_shell_stdin", true
-	case "ForceBackgroundShell":
-		return "force_background_shell", true
-	case "Task":
-		return "subagent", true
-	default:
-		return "", false
-	}
-}
+
 
 func isExecTool(name string) bool {
 	switch strings.TrimSpace(name) {
