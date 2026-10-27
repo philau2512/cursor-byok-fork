@@ -203,4 +203,73 @@ You are a dummy agent.
 	}
 }
 
+func TestHydrateLocalMCPDescriptorsFullDescription(t *testing.T) {
+	tempDir := t.TempDir()
+	toolDefPath := filepath.Join(tempDir, "InspectChanges.json")
+	toolJSON := `{
+		"name": "InspectChanges",
+		"description": "Inspects uncommitted Git changes (status and diff) with structured summaries."
+	}`
+	if err := os.WriteFile(toolDefPath, []byte(toolJSON), 0644); err != nil {
+		t.Fatalf("write tool json: %v", err)
+	}
+
+	compiled, err := NewEngine().Compile(CompileInput{
+		Mode: agentv1.AgentMode_AGENT_MODE_AGENT,
+		RequestContext: &agentv1.RequestContext{
+			McpFileSystemOptions: &agentv1.McpFileSystemOptions{
+				Enabled:             true,
+				WorkspaceProjectDir: tempDir,
+				McpDescriptors: []*agentv1.McpDescriptor{
+					{
+						ServerIdentifier: "user-code-intel",
+						ServerName:       "code-intel",
+						FolderPath:       proto.String(tempDir),
+						Tools: []*agentv1.McpToolDescriptor{
+							{
+								ToolName:       "InspectChanges",
+								DefinitionPath: proto.String(toolDefPath),
+							},
+						},
+					},
+					{
+						ServerIdentifier: "user-fast-context",
+						ServerName:       "fast-context",
+						Tools: []*agentv1.McpToolDescriptor{
+							{
+								ToolName: "fast_context_search",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	joined := make([]string, 0, len(compiled.Messages))
+	for _, message := range compiled.Messages {
+		joined = append(joined, message.Content)
+	}
+	prompt := strings.Join(joined, "\n")
+
+	if !strings.Contains(prompt, "<mcp_file_system>") {
+		t.Fatal("compiled prompt missing <mcp_file_system>")
+	}
+	if !strings.Contains(prompt, `<mcp_tool name="InspectChanges">`) {
+		t.Fatal("compiled prompt missing InspectChanges tool")
+	}
+	if !strings.Contains(prompt, "<description>Inspects uncommitted Git changes (status and diff) with structured summaries.</description>") {
+		t.Fatal("compiled prompt missing hydrated full description for InspectChanges")
+	}
+	if !strings.Contains(prompt, `<mcp_tool name="fast_context_search">`) {
+		t.Fatal("compiled prompt missing fast_context_search tool")
+	}
+	if !strings.Contains(prompt, "Fast semantic codebase search and context discovery") {
+		t.Fatal("compiled prompt missing fallback description for fast_context_search in mcp_file_system")
+	}
+}
+
 

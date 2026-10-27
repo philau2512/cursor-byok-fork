@@ -316,6 +316,7 @@ func buildMessagesFromRequestContext(requestContext *agentv1.RequestContext) []M
 
 	mergeLocalSkills(requestContext)
 	mergeLocalSubagents(requestContext)
+	hydrateLocalMCPDescriptors(requestContext)
 
 	sections := append(buildRequestContextStaticSections(requestContext), buildRequestContextRealtimeSections(requestContext)...)
 	if len(sections) == 0 {
@@ -816,7 +817,11 @@ func buildEmbeddedMCPDescriptorSection(descriptor *agentv1.McpDescriptor, server
 		if definitionPath := strings.TrimSpace(tool.GetDefinitionPath()); definitionPath != "" {
 			entry += "\n<definition_path>" + escapePromptXML(definitionPath) + "</definition_path>"
 		}
-		if description := strings.TrimSpace(tool.GetDescription()); description != "" {
+		description := strings.TrimSpace(tool.GetDescription())
+		if description == "" {
+			description = getFallbackMcpToolDescription(serverID, toolName)
+		}
+		if description != "" {
 			entry += "\n<description>" + escapePromptXML(description) + "</description>"
 		}
 		if inputSchema := strings.TrimSpace(compactProtoJSON(tool.GetInputSchema())); inputSchema != "" {

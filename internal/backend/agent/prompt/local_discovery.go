@@ -3,10 +3,14 @@ package promptengine
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 
 	"cursor/gen/agentv1"
@@ -303,4 +307,97 @@ func addAgentFromFile(requestContext *agentv1.RequestContext, absPath string, de
 		Model:       model,
 		Prompt:      body,
 	})
+}
+
+type mcpToolFilePayload struct {
+	Description string `json:"description"`
+}
+
+var (
+	mcpDescCacheMu sync.RWMutex
+	mcpDescCache   = make(map[string]cachedMcpDesc)
+)
+
+type cachedMcpDesc struct {
+	modTime     time.Time
+	description string
+}
+
+func readMCPToolFullDescription(defPath string) string {
+	cleanPath := filepath.Clean(defPath)
+	info, err := os.Stat(cleanPath)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+
+	mcpDescCacheMu.RLock()
+	cached, ok := mcpDescCache[cleanPath]
+	mcpDescCacheMu.RUnlock()
+
+	if ok && cached.modTime.Equal(info.ModTime()) {
+		return cached.description
+	}
+
+	data, err := os.ReadFile(cleanPath)
+	if err != nil {
+		return ""
+	}
+
+	var payload mcpToolFilePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+
+	desc := strings.TrimSpace(payload.Description)
+	mcpDescCacheMu.Lock()
+	mcpDescCache[cleanPath] = cachedMcpDesc{
+		modTime:     info.ModTime(),
+		description: desc,
+	}
+	mcpDescCacheMu.Unlock()
+
+	return desc
+}
+
+// hydrateLocalMCPDescriptors 从 definition_path 文件或 fallback 规则中自动补齐 MCP 工具的完整 description。
+func hydrateLocalMCPDescriptors(requestContext *agentv1.RequestContext) {
+	if requestContext == nil {
+		return
+	}
+	var descriptors []*agentv1.McpDescriptor
+	if fsOpts := requestContext.GetMcpFileSystemOptions(); fsOpts != nil {
+		descriptors = append(descriptors, fsOpts.GetMcpDescriptors()...)
+	}
+	if metaOpts := requestContext.GetMcpMetaToolOptions(); metaOpts != nil {
+		descriptors = append(descriptors, metaOpts.GetMcpDescriptors()...)
+	}
+
+	for _, desc := range descriptors {
+		if desc == nil {
+			continue
+		}
+		serverID := firstNonEmpty(strings.TrimSpace(desc.GetServerIdentifier()), strings.TrimSpace(desc.GetServerName()))
+		folderPath := strings.TrimSpace(desc.GetFolderPath())
+		for _, tool := range desc.GetTools() {
+			if tool == nil {
+				continue
+			}
+			if strings.TrimSpace(tool.GetDescription()) != "" {
+				continue
+			}
+			defPath := strings.TrimSpace(tool.GetDefinitionPath())
+			if defPath == "" && folderPath != "" {
+				defPath = filepath.Join(folderPath, "tools", tool.GetToolName()+".json")
+			}
+			if defPath != "" {
+				if descText := readMCPToolFullDescription(defPath); descText != "" {
+					tool.Description = proto.String(descText)
+					continue
+				}
+			}
+			if fb := getFallbackMcpToolDescription(serverID, tool.GetToolName()); fb != "" {
+				tool.Description = proto.String(fb)
+			}
+		}
+	}
 }
