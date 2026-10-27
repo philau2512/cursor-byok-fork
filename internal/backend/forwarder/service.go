@@ -316,7 +316,13 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 
 // Close flushes telemetry that is intentionally persisted outside provider completion paths.
 func (service *Service) Close(ctx context.Context) error {
-	if service == nil || service.usageStore == nil {
+	if service == nil {
+		return nil
+	}
+	if service.debug != nil {
+		service.debug.Close()
+	}
+	if service.usageStore == nil {
 		return nil
 	}
 	return service.usageStore.Close(ctx)

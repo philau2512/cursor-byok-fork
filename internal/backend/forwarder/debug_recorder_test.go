@@ -17,6 +17,29 @@ func (config testObservabilityConfig) IsObservabilityLogEnabled(context.Context)
 	return config.enabled
 }
 
+func TestServiceCloseWaitsForDebugRecorder(t *testing.T) {
+	recorder := newDebugRecorderWithQueue(t.TempDir(), nil, nil, 1)
+	service := &Service{debug: recorder}
+	recorder.writeMu.Lock()
+	recorder.queue <- debugRecord{dir: t.TempDir(), filename: "shutdown.jsonl", payload: []byte("{}\n")}
+	closed := make(chan error, 1)
+	go func() { closed <- service.Close(context.Background()) }()
+	select {
+	case <-closed:
+		t.Fatal("Service.Close returned before the debug recorder worker stopped")
+	case <-time.After(50 * time.Millisecond):
+	}
+	recorder.writeMu.Unlock()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Service.Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Service.Close did not wait for the debug recorder worker")
+	}
+}
+
 func TestDebugRecorderQueueMetricsAndFlush(t *testing.T) {
 	recorder := newDebugRecorderWithQueue(t.TempDir(), nil, testObservabilityConfig{enabled: true}, 8)
 	defer recorder.Close()

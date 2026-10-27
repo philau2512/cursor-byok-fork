@@ -12,6 +12,7 @@ import (
 	goruntime "runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cursor/internal/ads"
@@ -63,6 +64,56 @@ func init() {
 	application.RegisterEvent[updater.ProgressPayload](updater.EventProgress)
 	application.RegisterEvent[updater.ReadyPayload](updater.EventReady)
 	application.RegisterEvent[updater.ErrorPayload](updater.EventError)
+}
+
+type adRefreshCoalescer struct {
+	ctx     context.Context
+	refresh func(context.Context)
+
+	mu      sync.Mutex
+	running bool
+	pending bool
+}
+
+func newAdRefreshCoalescer(ctx context.Context, refresh func(context.Context)) func() {
+	coalescer := &adRefreshCoalescer{ctx: ctx, refresh: refresh}
+	return coalescer.Trigger
+}
+
+func (coalescer *adRefreshCoalescer) Trigger() {
+	if coalescer == nil || coalescer.ctx == nil || coalescer.refresh == nil || coalescer.ctx.Err() != nil {
+		return
+	}
+	coalescer.mu.Lock()
+	defer coalescer.mu.Unlock()
+	if coalescer.running {
+		coalescer.pending = true
+		return
+	}
+	coalescer.running = true
+	go coalescer.run()
+}
+
+func (coalescer *adRefreshCoalescer) run() {
+	defer func() {
+		coalescer.mu.Lock()
+		coalescer.running = false
+		coalescer.mu.Unlock()
+	}()
+	for {
+		if coalescer.ctx.Err() != nil {
+			return
+		}
+		coalescer.refresh(coalescer.ctx)
+		coalescer.mu.Lock()
+		if !coalescer.pending || coalescer.ctx.Err() != nil {
+			coalescer.pending = false
+			coalescer.mu.Unlock()
+			return
+		}
+		coalescer.pending = false
+		coalescer.mu.Unlock()
+	}
 }
 
 // Run 用于处理与 Run 相关的逻辑。
@@ -187,11 +238,7 @@ func Run(resources EmbeddedResources) error {
 		}
 		app.Event.Emit(ads.EventUpdated, runtimeState)
 	}
-	refreshAdAsync := func() {
-		go func() {
-			refreshAd(context.Background())
-		}()
-	}
+	refreshAdAsync := newAdRefreshCoalescer(adRefreshCtx, refreshAd)
 	startAdRefreshLoop := func(ctx context.Context) {
 		go func() {
 			refreshAd(ctx)
