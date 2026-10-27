@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"cursor/gen/agentv1"
@@ -468,8 +467,8 @@ func extractReplayFieldJSON(message protoreflect.Message, fieldName string) (str
 	if !child.IsValid() {
 		return "", false
 	}
-	item, ok := child.Interface().(proto.Message)
-	if !ok {
+	item := child.Interface()
+	if item == nil {
 		return "", false
 	}
 	return compactProtoJSON(item), true

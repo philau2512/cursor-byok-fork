@@ -2,6 +2,7 @@ package prompt
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -26,7 +27,7 @@ const (
 
 // assetFS 保存按模式组织的静态 prompt 与 tools 资产。
 //
-//go:embed common_prefix.md ask/prompt.md ask/tools.json plan/prompt.md plan/system_reminder.txt plan/tools.json agent/prompt.md agent/tools.json debug/prompt.md debug/tools.json debug/system_reminder_initial.txt debug/system_reminder_continuing.txt multitask/prompt.md multitask/tools.json subagent/prompt.md subagent/tools.json compaction/prompt.md commit/prompt.md
+//go:embed tools.json modes/*.json ask/prompt.md plan/prompt.md plan/system_reminder.txt agent/prompt.md debug/prompt.md debug/system_reminder_initial.txt debug/system_reminder_continuing.txt multitask/prompt.md subagent/prompt.md compaction/prompt.md commit/prompt.md
 var assetFS embed.FS
 
 var (
@@ -39,31 +40,140 @@ var (
 	cachedCommitPrompt            string
 )
 
+type rawToolFunction struct {
+	Name string `json:"name"`
+}
+
+type rawToolWrapper struct {
+	Type     string          `json:"type"`
+	Function rawToolFunction `json:"function"`
+}
+
+type toolsCatalogFile struct {
+	Tools    []json.RawMessage          `json:"tools"`
+	Variants map[string]json.RawMessage `json:"variants"`
+}
+
+type modeManifestTool struct {
+	Name    string `json:"name"`
+	Variant string `json:"variant"`
+}
+
+func (m *modeManifestTool) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if strings.Contains(s, ".") {
+			parts := strings.SplitN(s, ".", 2)
+			m.Name = parts[0]
+			m.Variant = parts[1]
+		} else {
+			m.Name = s
+		}
+		return nil
+	}
+	type rawEntry modeManifestTool
+	var raw rawEntry
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = modeManifestTool(raw)
+	return nil
+}
+
+type modeManifestFile struct {
+	Tools []modeManifestTool `json:"tools"`
+}
+
+func assembleModeTools(mode Mode) ([]byte, error) {
+	catalogData, err := assetFS.ReadFile("tools.json")
+	if err != nil {
+		return nil, fmt.Errorf("read tools.json: %w", err)
+	}
+	var catalog toolsCatalogFile
+	if err := json.Unmarshal(catalogData, &catalog); err != nil {
+		return nil, fmt.Errorf("unmarshal tools.json: %w", err)
+	}
+
+	canonicalTools := make(map[string]json.RawMessage, len(catalog.Tools))
+	for _, item := range catalog.Tools {
+		var wrapper rawToolWrapper
+		if err := json.Unmarshal(item, &wrapper); err != nil || strings.TrimSpace(wrapper.Function.Name) == "" {
+			continue
+		}
+		canonicalTools[wrapper.Function.Name] = item
+	}
+
+	variants := make(map[string]json.RawMessage, len(catalog.Variants))
+	for key, item := range catalog.Variants {
+		variants[strings.TrimSpace(key)] = item
+	}
+
+	manifestPath := fmt.Sprintf("modes/%s.json", mode)
+	manifestData, err := assetFS.ReadFile(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("read tool manifest %q: %w", manifestPath, err)
+	}
+	var manifest modeManifestFile
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, fmt.Errorf("unmarshal tool manifest %q: %w", manifestPath, err)
+	}
+
+	selectedTools := make([]json.RawMessage, 0, len(manifest.Tools))
+	for _, toolEntry := range manifest.Tools {
+		name := strings.TrimSpace(toolEntry.Name)
+		if name == "" {
+			continue
+		}
+		var toolDef json.RawMessage
+		var found bool
+
+		// 1. 显式指定的 variant (e.g. {name: "CreatePlan", variant: "plan"})
+		if toolEntry.Variant != "" {
+			variantKey := fmt.Sprintf("%s.%s", name, strings.TrimSpace(toolEntry.Variant))
+			if v, ok := variants[variantKey]; ok {
+				toolDef = v
+				found = true
+			}
+		}
+
+		// 2. 当前 mode 专属 variant (e.g. CreatePlan.plan)
+		if !found {
+			modeVariantKey := fmt.Sprintf("%s.%s", name, mode)
+			if v, ok := variants[modeVariantKey]; ok {
+				toolDef = v
+				found = true
+			}
+		}
+
+		// 3. 全局 canonical tool
+		if !found {
+			if t, ok := canonicalTools[name]; ok {
+				toolDef = t
+				found = true
+			}
+		}
+
+		if !found {
+			return nil, fmt.Errorf("mode %q references unknown tool %q", mode, name)
+		}
+		selectedTools = append(selectedTools, toolDef)
+	}
+
+	return json.Marshal(selectedTools)
+}
+
 func init() {
 	for _, mode := range []Mode{ModeAsk, ModePlan, ModeAgent, ModeDebug, ModeMultitask, ModeSubagent} {
 		path := fmt.Sprintf("%s/prompt.md", mode)
-		if mode == ModeSubagent || mode == ModeDebug {
-			data, err := assetFS.ReadFile(path)
-			if err != nil {
-				panic(fmt.Errorf("cache prompt %q: %w", path, err))
-			}
-			cachedPrompts[mode] = string(data)
-		} else {
-			prefix, err := assetFS.ReadFile("common_prefix.md")
-			if err != nil {
-				panic(fmt.Errorf("cache common prefix: %w", err))
-			}
-			data, err := assetFS.ReadFile(path)
-			if err != nil {
-				panic(fmt.Errorf("cache prompt %q: %w", path, err))
-			}
-			cachedPrompts[mode] = string(prefix) + "\n\n" + string(data)
-		}
-
-		toolPath := fmt.Sprintf("%s/tools.json", mode)
-		toolData, err := assetFS.ReadFile(toolPath)
+		data, err := assetFS.ReadFile(path)
 		if err != nil {
-			panic(fmt.Errorf("cache tools %q: %w", toolPath, err))
+			panic(fmt.Errorf("cache prompt %q: %w", path, err))
+		}
+		cachedPrompts[mode] = string(data)
+
+		toolData, err := assembleModeTools(mode)
+		if err != nil {
+			panic(fmt.Errorf("assemble tools for mode %q: %w", mode, err))
 		}
 		cachedTools[mode] = toolData
 	}
@@ -105,12 +215,23 @@ func PromptPath(mode Mode) (string, error) {
 }
 
 // ToolsPath 返回指定模式的静态工具资产路径。
+// ToolsPath 返回指定模式的静态工具清单资产路径。
 func ToolsPath(mode Mode) (string, error) {
 	normalized, err := normalizeMode(mode)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s/tools.json", normalized), nil
+	return fmt.Sprintf("modes/%s.json", normalized), nil
+}
+
+// ToolsCatalogPath 返回全局工具目录定义路径。
+func ToolsCatalogPath() string {
+	return "tools.json"
+}
+
+// ReadToolsCatalog 读取全局工具目录定义 JSON。
+func ReadToolsCatalog() ([]byte, error) {
+	return assetFS.ReadFile("tools.json")
 }
 
 // ReadPrompt 读取指定模式的静态提示词文本。
@@ -139,7 +260,7 @@ func MustReadPrompt(mode Mode) string {
 	return text
 }
 
-// ReadTools 读取指定模式的原始工具 JSON。
+// ReadTools 读取指定模式组装后的工具 JSON 数组。
 func ReadTools(mode Mode) ([]byte, error) {
 	normalized, err := normalizeMode(mode)
 	if err != nil {
@@ -148,15 +269,12 @@ func ReadTools(mode Mode) ([]byte, error) {
 	if tools, ok := cachedTools[normalized]; ok {
 		return tools, nil
 	}
-	path, err := ToolsPath(mode)
+	tools, err := assembleModeTools(normalized)
 	if err != nil {
 		return nil, err
 	}
-	data, err := assetFS.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read tools asset %q: %w", path, err)
-	}
-	return data, nil
+	cachedTools[normalized] = tools
+	return tools, nil
 }
 
 // MustReadTools 读取指定模式的原始工具 JSON，失败时直接 panic。

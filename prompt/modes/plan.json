@@ -1,0 +1,42 @@
+{
+  "tools": [
+    "Shell",
+    "AwaitShell",
+    {
+      "name": "WriteShellStdin",
+      "variant": "plan"
+    },
+    "ForceBackgroundShell",
+    "Glob",
+    "Grep",
+    "Read",
+    "Ls",
+    "TodoWrite",
+    "ReadLints",
+    "WebSearch",
+    "WebFetch",
+    "AskQuestion",
+    {
+      "name": "CreatePlan",
+      "variant": "plan"
+    },
+    {
+      "name": "Task",
+      "variant": "plan"
+    },
+    "FetchMcpResource",
+    {
+      "name": "Delete",
+      "variant": "plan"
+    },
+    {
+      "name": "PatchEdit",
+      "variant": "plan"
+    },
+    {
+      "name": "Write",
+      "variant": "plan"
+    },
+    "CallMcpTool"
+  ]
+}

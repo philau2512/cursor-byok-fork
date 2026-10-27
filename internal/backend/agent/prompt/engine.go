@@ -314,6 +314,10 @@ func buildMessagesFromRequestContext(requestContext *agentv1.RequestContext) []M
 		return nil
 	}
 
+	mergeLocalSkills(requestContext)
+	mergeLocalSubagents(requestContext)
+	hydrateLocalMCPDescriptors(requestContext)
+
 	sections := append(buildRequestContextStaticSections(requestContext), buildRequestContextRealtimeSections(requestContext)...)
 	if len(sections) == 0 {
 		return nil
@@ -333,7 +337,7 @@ func buildRequestContextStaticSections(requestContext *agentv1.RequestContext) [
 	if requestContext == nil {
 		return nil
 	}
-	sections := make([]string, 0, 5)
+	sections := make([]string, 0, 7)
 	if userInfo := buildRequestContextUserInfoSection(requestContext); userInfo != "" {
 		sections = append(sections, userInfo)
 	}
@@ -346,7 +350,12 @@ func buildRequestContextStaticSections(requestContext *agentv1.RequestContext) [
 	if skills := buildRequestContextAgentSkillsSection(requestContext); skills != "" {
 		sections = append(sections, skills)
 	}
-	if mcp := buildRequestContextMCPFileSystemSection(requestContext); mcp != "" {
+	if subagents := buildRequestContextCustomSubagentsSection(requestContext); subagents != "" {
+		sections = append(sections, subagents)
+	}
+	if mcpMeta := buildRequestContextMCPMetaToolsSection(requestContext); mcpMeta != "" {
+		sections = append(sections, mcpMeta)
+	} else if mcp := buildRequestContextMCPFileSystemSection(requestContext); mcp != "" {
 		sections = append(sections, mcp)
 	}
 	return sections
@@ -592,6 +601,133 @@ func buildRequestContextMCPFileSystemSection(requestContext *agentv1.RequestCont
 	)
 }
 
+// buildRequestContextCustomSubagentsSection 构造 <subagents> 片段。
+func buildRequestContextCustomSubagentsSection(requestContext *agentv1.RequestContext) string {
+	if requestContext == nil || len(requestContext.GetCustomSubagents()) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(requestContext.GetCustomSubagents()))
+	for _, agent := range requestContext.GetCustomSubagents() {
+		if agent == nil {
+			continue
+		}
+		name := strings.TrimSpace(agent.GetName())
+		if name == "" {
+			continue
+		}
+		description := strings.TrimSpace(agent.GetDescription())
+		if description != "" {
+			lines = append(lines, fmt.Sprintf(`<subagent name="%s">%s</subagent>`, escapePromptXML(name), escapePromptXML(description)))
+		} else {
+			lines = append(lines, fmt.Sprintf(`<subagent name="%s"/>`, escapePromptXML(name)))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "<subagents>\n" + strings.Join(lines, "\n") + "\n</subagents>"
+}
+
+const fastContextFallbackDescription = "Fast semantic codebase search and context discovery. Locates relevant files, exact line ranges, and code regions from natural language descriptions in a single step, without needing manual grep trials or knowing exact filenames.\n\nRecommended for:\n- Finding feature implementations, business logic, and API flows (e.g. 'where is payment webhook handled', 'auth token refresh flow').\n- Exploring unfamiliar codebases or locating where conceptual logic lives.\n- Getting high-relevance entry points, line ranges, and suggested grep keywords before reading code.\n\nUse exact-match grep instead only when searching for a known, specific symbol name or literal string.\n\nFor best semantic search quality, write the query primarily in English; add local-language business terms only when needed.\nUse tree_depth/max_turns/max_results for task-level tuning; use exclude_paths to reduce payload or noise.\n- include_code_snippets: Default false (lightweight mode, ~2-5KB output). Set to true to include full code snippets in the response (~45KB output).\nResponse includes a [config] line showing actual parameters used - use this to decide adjustments on retry."
+
+func getFallbackMcpToolDescription(serverID string, toolName string) string {
+	normalizedServer := strings.TrimPrefix(strings.ToLower(serverID), "user-")
+	if (normalizedServer == "fast-context" || normalizedServer == "fast_context") && toolName == "fast_context_search" {
+		return fastContextFallbackDescription
+	}
+	return ""
+}
+
+// buildRequestContextMCPMetaToolsSection 构造现代 Cursor 客户端的 <mcp_meta_tools> 片段。
+func buildRequestContextMCPMetaToolsSection(requestContext *agentv1.RequestContext) string {
+	if requestContext == nil || requestContext.GetMcpMetaToolOptions() == nil {
+		return ""
+	}
+	options := requestContext.GetMcpMetaToolOptions()
+	descriptors := options.GetMcpDescriptors()
+	if len(descriptors) == 0 {
+		return ""
+	}
+
+	serverEntries := make([]string, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		if descriptor == nil {
+			continue
+		}
+		serverEntry := buildMetaToolServerEntry(descriptor)
+		if serverEntry != "" {
+			serverEntries = append(serverEntries, serverEntry)
+		}
+	}
+	if len(serverEntries) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf(
+		"<mcp_meta_tools>\nThe following MCP tools are available. Call a listed tool directly with CallMcpTool without calling GetMcpTools first. If a call returns an error, use it to correct the arguments or authentication and retry when appropriate.\n<mcp_meta_tool_servers>\n%s\n</mcp_meta_tool_servers>\n</mcp_meta_tools>",
+		strings.Join(serverEntries, "\n"),
+	)
+}
+
+func buildMetaToolServerEntry(descriptor *agentv1.McpDescriptor) string {
+	if descriptor == nil {
+		return ""
+	}
+	serverID := strings.TrimSpace(descriptor.GetServerIdentifier())
+	if serverID == "" {
+		serverID = strings.TrimSpace(descriptor.GetServerName())
+	}
+	if serverID == "" {
+		return ""
+	}
+	serverName := strings.TrimSpace(descriptor.GetServerName())
+	if serverName == "" {
+		serverName = serverID
+	}
+
+	toolEntries := make([]string, 0, len(descriptor.GetTools()))
+	for _, tool := range descriptor.GetTools() {
+		if tool == nil {
+			continue
+		}
+		toolName := strings.TrimSpace(tool.GetToolName())
+		if toolName == "" {
+			continue
+		}
+		entryLines := []string{fmt.Sprintf(`<mcp_tool name="%s">`, escapePromptXML(toolName))}
+		if definitionPath := strings.TrimSpace(tool.GetDefinitionPath()); definitionPath != "" {
+			entryLines = append(entryLines, "<definition_path>"+escapePromptXML(definitionPath)+"</definition_path>")
+		}
+		description := strings.TrimSpace(tool.GetDescription())
+		if description == "" {
+			description = getFallbackMcpToolDescription(serverID, toolName)
+		}
+		if description != "" {
+			entryLines = append(entryLines, "<description>"+escapePromptXML(description)+"</description>")
+		}
+		inputSchema := strings.TrimSpace(tool.GetInputSchemaJson())
+		if inputSchema == "" && tool.GetInputSchema() != nil {
+			inputSchema = strings.TrimSpace(compactProtoJSON(tool.GetInputSchema()))
+		}
+		if inputSchema != "" {
+			entryLines = append(entryLines, "<input_schema>"+escapePromptXML(inputSchema)+"</input_schema>")
+		}
+		entryLines = append(entryLines, "</mcp_tool>")
+		toolEntries = append(toolEntries, strings.Join(entryLines, "\n"))
+	}
+
+	if len(toolEntries) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf(
+		"<mcp_meta_tool_server name=\"%s\" identifier=\"%s\">\n<tools>\n%s\n</tools>\n</mcp_meta_tool_server>",
+		escapePromptXML(serverName),
+		escapePromptXML(serverID),
+		strings.Join(toolEntries, "\n"),
+	)
+}
+
 func buildRequestContextUserIntentSummarySection(requestContext *agentv1.RequestContext) string {
 	if requestContext == nil {
 		return ""
@@ -681,7 +817,11 @@ func buildEmbeddedMCPDescriptorSection(descriptor *agentv1.McpDescriptor, server
 		if definitionPath := strings.TrimSpace(tool.GetDefinitionPath()); definitionPath != "" {
 			entry += "\n<definition_path>" + escapePromptXML(definitionPath) + "</definition_path>"
 		}
-		if description := strings.TrimSpace(tool.GetDescription()); description != "" {
+		description := strings.TrimSpace(tool.GetDescription())
+		if description == "" {
+			description = getFallbackMcpToolDescription(serverID, toolName)
+		}
+		if description != "" {
 			entry += "\n<description>" + escapePromptXML(description) + "</description>"
 		}
 		if inputSchema := strings.TrimSpace(compactProtoJSON(tool.GetInputSchema())); inputSchema != "" {

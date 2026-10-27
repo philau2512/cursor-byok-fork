@@ -278,29 +278,7 @@ func isChildConversationSubagentTypeName(subagentTypeName string) bool {
 	return strings.TrimSpace(subagentTypeName) != ""
 }
 
-func selectToolsByOrderedNames(items []json.RawMessage, orderedNames []string) ([]json.RawMessage, []string, error) {
-	byName := make(map[string]json.RawMessage, len(items))
-	for _, item := range items {
-		name, err := extractToolName(item)
-		if err != nil {
-			return nil, nil, err
-		}
-		if _, exists := byName[name]; !exists {
-			byName[name] = item
-		}
-	}
-	filtered := make([]json.RawMessage, 0, len(orderedNames))
-	names := make([]string, 0, len(orderedNames))
-	for _, name := range orderedNames {
-		item, ok := byName[name]
-		if !ok {
-			return nil, nil, fmt.Errorf("tool descriptor %q not found in prompt asset", name)
-		}
-		filtered = append(filtered, item)
-		names = append(names, name)
-	}
-	return filtered, names, nil
-}
+
 
 func toolAssetModeForConversation(mode agentv1.AgentMode, subagentTypeName string) (promptassets.Mode, error) {
 	if isChildConversationSubagentTypeName(subagentTypeName) {

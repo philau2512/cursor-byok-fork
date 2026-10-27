@@ -89,7 +89,7 @@ func NewManager(app *application.App) *Manager {
 
 func (m *Manager) Start() {
 	m.emitState(StateIdle, nil, "", "", false, "")
-	go m.loop()
+	// Đã tắt tự động check và tải version mới khi mở ứng dụng.
 }
 
 func (m *Manager) Shutdown() {
@@ -104,7 +104,8 @@ func (m *Manager) InstallReadyUpdate() error {
 	return m.installReadyUpdate()
 }
 
-func (m *Manager) loop() {
+// StartPeriodicCheck có thể được gọi nếu cần kích hoạt vòng lặp kiểm tra định kỳ ngầm.
+func (m *Manager) StartPeriodicCheck() {
 	m.checkNow(false)
 
 	ticker := time.NewTicker(checkInterval)

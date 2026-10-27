@@ -1,0 +1,26 @@
+{
+  "tools": [
+    "AskQuestion",
+    "CallMcpTool",
+    "Delete",
+    "FetchMcpResource",
+    "Glob",
+    "Grep",
+    "Read",
+    "Ls",
+    "ReadLints",
+    "Shell",
+    "AwaitShell",
+    "WriteShellStdin",
+    "ForceBackgroundShell",
+    "PatchEdit",
+    "SwitchMode",
+    "Task",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "CreatePlan",
+    "Write",
+    "GenerateImage"
+  ]
+}
