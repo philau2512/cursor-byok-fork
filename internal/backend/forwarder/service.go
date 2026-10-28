@@ -1924,7 +1924,7 @@ func (service *Service) runProviderStream(stream *ActiveStream, token uint64, ct
 
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
-	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
+	if err := providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID); err != nil {
 		return err
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
@@ -1995,7 +1995,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	startedToolCall := buildStartedToolCall(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
-		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
+		return providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID)
 	}
 	if startedToolCall != nil {
 		if err := ensureLoopActive(); err != nil {
@@ -2918,23 +2918,76 @@ func extractPrependUserMessages(message *agentv1.AgentClientMessage) []*agentv1.
 	}
 }
 
-// extractRequestContext 从 legacy 请求中提取 request_context。
+// extractRequestContext 提取 request_context，优先兼容现代 Cursor 的 RequestContextParts.DynamicContext，
+// 并与 action 中可能包含的 legacy context 自动做防御性合并。
 func extractRequestContext(message *agentv1.AgentClientMessage) *agentv1.RequestContext {
 	if message == nil || message.GetRunRequest() == nil || message.GetRunRequest().GetAction() == nil {
 		return nil
 	}
-	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
+	action := message.GetRunRequest().GetAction()
+
+	var legacyContext *agentv1.RequestContext
+	switch item := action.GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetRequestContext()
+		legacyContext = item.UserMessageAction.GetRequestContext()
 	case *agentv1.ConversationAction_ResumeAction:
-		return item.ResumeAction.GetRequestContext()
+		legacyContext = item.ResumeAction.GetRequestContext()
 	case *agentv1.ConversationAction_StartPlanAction:
-		return item.StartPlanAction.GetRequestContext()
+		legacyContext = item.StartPlanAction.GetRequestContext()
 	case *agentv1.ConversationAction_ExecutePlanAction:
-		return item.ExecutePlanAction.GetRequestContext()
-	default:
-		return nil
+		legacyContext = item.ExecutePlanAction.GetRequestContext()
 	}
+
+	parts := action.GetRequestContextParts()
+	if parts != nil && parts.GetDynamicContext() != nil {
+		dynamic := parts.GetDynamicContext()
+		if legacyContext == nil {
+			return dynamic
+		}
+		return mergeRequestContexts(dynamic, legacyContext)
+	}
+	return legacyContext
+}
+
+func mergeRequestContexts(dynamic *agentv1.RequestContext, legacy *agentv1.RequestContext) *agentv1.RequestContext {
+	if dynamic == nil {
+		return legacy
+	}
+	if legacy == nil {
+		return dynamic
+	}
+	merged, ok := proto.Clone(dynamic).(*agentv1.RequestContext)
+	if !ok || merged == nil {
+		merged = dynamic
+	}
+	if merged.GetEnv() == nil && legacy.GetEnv() != nil {
+		merged.Env = legacy.GetEnv()
+	}
+	if len(merged.GetGitRepos()) == 0 && len(legacy.GetGitRepos()) > 0 {
+		merged.GitRepos = legacy.GetGitRepos()
+	}
+	if len(merged.GetAgentSkills()) == 0 && len(legacy.GetAgentSkills()) > 0 {
+		merged.AgentSkills = legacy.GetAgentSkills()
+	}
+	if merged.GetSkillOptions() == nil && legacy.GetSkillOptions() != nil {
+		merged.SkillOptions = legacy.GetSkillOptions()
+	}
+	if len(merged.GetCustomSubagents()) == 0 && len(legacy.GetCustomSubagents()) > 0 {
+		merged.CustomSubagents = legacy.GetCustomSubagents()
+	}
+	if len(merged.GetRules()) == 0 && len(legacy.GetRules()) > 0 {
+		merged.Rules = legacy.GetRules()
+	}
+	if len(merged.GetNonFileRules()) == 0 && len(legacy.GetNonFileRules()) > 0 {
+		merged.NonFileRules = legacy.GetNonFileRules()
+	}
+	if merged.GetMcpMetaToolOptions() == nil && legacy.GetMcpMetaToolOptions() != nil {
+		merged.McpMetaToolOptions = legacy.GetMcpMetaToolOptions()
+	}
+	if merged.GetMcpFileSystemOptions() == nil && legacy.GetMcpFileSystemOptions() != nil {
+		merged.McpFileSystemOptions = legacy.GetMcpFileSystemOptions()
+	}
+	return merged
 }
 
 func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runRequest *agentv1.AgentRunRequest, userMessage *agentv1.UserMessage, requestContext *agentv1.RequestContext) bool {

@@ -53,7 +53,32 @@ func getCandidateRoots(requestContext *agentv1.RequestContext) []string {
 		}
 	}
 
+	// Also check parent directories if root is nested inside a workspace
+	for _, root := range append([]string(nil), roots...) {
+		curr := root
+		for i := 0; i < 3; i++ {
+			parent := filepath.Dir(curr)
+			if parent == curr || parent == "" || parent == "." {
+				break
+			}
+			if hasProjectMarker(parent) {
+				addRoot(parent)
+			}
+			curr = parent
+		}
+	}
+
 	return roots
+}
+
+func hasProjectMarker(dir string) bool {
+	markers := []string{".cursor", ".agents", ".git"}
+	for _, m := range markers {
+		if info, err := os.Stat(filepath.Join(dir, m)); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func parseFrontmatter(content string) (map[string]interface{}, string) {
@@ -122,6 +147,7 @@ func mergeLocalSkills(requestContext *agentv1.RequestContext) {
 			filepath.Join(home, ".cursor", "skills"),
 			filepath.Join(home, ".agents", "skills"),
 			filepath.Join(home, ".claude", "skills"),
+			filepath.Join(home, ".cursor-local-assistant-v2", "skills"),
 		)
 	}
 
@@ -240,6 +266,8 @@ func mergeLocalSubagents(requestContext *agentv1.RequestContext) {
 			filepath.Join(home, ".cursor", "agents"),
 			filepath.Join(home, ".cursor", "subagents"),
 			filepath.Join(home, ".agents", "subagents"),
+			filepath.Join(home, ".cursor-local-assistant-v2", "agents"),
+			filepath.Join(home, ".cursor-local-assistant-v2", "subagents"),
 		)
 	}
 
