@@ -67,6 +67,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 		if _, exists := parsed.Overrides[subagentType]; exists {
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "duplicate_overrides_previous"})
 		}
+		var parsedSelection runtimecore.SubagentModelOverrideSelection
 		switch selection := item.GetSelection().(type) {
 		case *agentv1.SubagentModelOverride_Model:
 			model := selection.Model
@@ -75,7 +76,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "empty_model_id"})
 				continue
 			}
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType:                  subagentType,
 				Selection:                     "model",
 				ModelID:                       modelID,
@@ -85,17 +86,30 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				IsVariantStringRepresentation: model.GetIsVariantStringRepresentation(),
 			}
 		case *agentv1.SubagentModelOverride_Inherit:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "inherit",
 			}
 		case *agentv1.SubagentModelOverride_Disabled:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "disabled",
 			}
 		default:
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "unknown_selection"})
+			continue
+		}
+		parsed.Overrides[subagentType] = parsedSelection
+		lower := strings.ToLower(subagentType)
+		if lower != subagentType {
+			if _, exists := parsed.Overrides[lower]; !exists {
+				parsed.Overrides[lower] = parsedSelection
+			}
+		}
+		if lower == "explorer" {
+			if _, exists := parsed.Overrides["explore"]; !exists {
+				parsed.Overrides["explore"] = parsedSelection
+			}
 		}
 	}
 	return parsed
@@ -133,7 +147,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 			effectiveModelID = ""
 		}
 	}
-	if effectiveModelID == "" && !disabled {
+	if (effectiveModelID == "" || effectiveModelID == "inherit" || effectiveModelID == "default" || effectiveModelID == "fast") && !disabled {
 		effectiveModelID = strings.TrimSpace(parentModelID)
 	}
 	payload := map[string]any{
@@ -625,6 +639,13 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			"overrides":      subagentModelOverrideSummaries(parsedOverrides.Overrides),
 			"ignored":        parsedOverrides.Ignored,
 		})
+		if (intent.ModelID == "" || intent.ModelID == "default") && intent.SubagentTypeName != "" {
+			if override, _, ok := runtimecore.LookupSubagentModelOverride(intent.SubagentModelOverrides, intent.SubagentTypeName); ok {
+				if strings.TrimSpace(override.Selection) == "model" && strings.TrimSpace(override.ModelID) != "" {
+					intent.ModelID = strings.TrimSpace(override.ModelID)
+				}
+			}
+		}
 		if intent.ModelID == "" {
 			intent.ModelID = "default"
 		}

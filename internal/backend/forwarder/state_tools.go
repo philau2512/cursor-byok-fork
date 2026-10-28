@@ -809,19 +809,28 @@ func buildTaskArgsFromMap(payload map[string]any) *agentv1.TaskArgs {
 }
 
 func subagentTypeFromString(raw string) *agentv1.SubagentType {
-	switch strings.TrimSpace(raw) {
-	case "explore":
+	trimmed := strings.TrimSpace(raw)
+	switch strings.ToLower(trimmed) {
+	case "explore", "explorer":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Explore{Explore: &agentv1.SubagentTypeExplore{}}}
-	case "browser-use", "browserUse":
+	case "browser-use", "browseruse":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_BrowserUse{BrowserUse: &agentv1.SubagentTypeBrowserUse{}}}
 	case "shell":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Shell{Shell: &agentv1.SubagentTypeShell{}}}
-	case "":
+	case "bash":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Bash{Bash: &agentv1.SubagentTypeBash{}}}
+	case "debug":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Debug{Debug: &agentv1.SubagentTypeDebug{}}}
+	case "cursor-guide", "cursorguide":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_CursorGuide{CursorGuide: &agentv1.SubagentTypeCursorGuide{}}}
+	case "computer-use", "computeruse":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_ComputerUse{ComputerUse: &agentv1.SubagentTypeComputerUse{}}}
+	case "", "generalpurpose", "general_purpose":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Unspecified{Unspecified: &agentv1.SubagentTypeUnspecified{}}}
 	default:
 		return &agentv1.SubagentType{
 			Type: &agentv1.SubagentType_Custom{
-				Custom: &agentv1.SubagentTypeCustom{Name: strings.TrimSpace(raw)},
+				Custom: &agentv1.SubagentTypeCustom{Name: trimmed},
 			},
 		}
 	}

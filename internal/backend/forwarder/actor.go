@@ -724,6 +724,16 @@ func taskSubagentTypeNameForDisplay(subagentType *agentv1.SubagentType) string {
 		return "browser-use"
 	case *agentv1.SubagentType_Shell:
 		return "shell"
+	case *agentv1.SubagentType_Bash:
+		return "bash"
+	case *agentv1.SubagentType_Debug:
+		return "debug"
+	case *agentv1.SubagentType_CursorGuide:
+		return "cursor-guide"
+	case *agentv1.SubagentType_ComputerUse:
+		return "computer-use"
+	case *agentv1.SubagentType_Unspecified:
+		return "generalPurpose"
 	case *agentv1.SubagentType_Custom:
 		return strings.TrimSpace(item.Custom.GetName())
 	default:

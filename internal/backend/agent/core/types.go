@@ -4,6 +4,7 @@ package runtimecore
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,21 +39,37 @@ func LookupSubagentModelOverride(overrides map[string]SubagentModelOverrideSelec
 
 func subagentModelOverrideLookupKeys(subagentType string) []string {
 	trimmed := strings.TrimSpace(subagentType)
-	if trimmed == "" {
-		return nil
+	var keys []string
+	if trimmed != "" {
+		keys = append(keys, trimmed)
+		lower := strings.ToLower(trimmed)
+		if lower != trimmed {
+			keys = append(keys, lower)
+		}
+		switch lower {
+		case "browser-use", "browseruse":
+			appendCandidateKeyIfMissing(&keys, "browser-use", "browserUse")
+		case "explore", "explorer":
+			appendCandidateKeyIfMissing(&keys, "explore", "generalPurpose")
+		case "generalpurpose", "general_purpose":
+			appendCandidateKeyIfMissing(&keys, "generalPurpose", "explore")
+		}
 	}
-	keys := []string{trimmed}
-	switch trimmed {
-	case "generalPurpose":
-		keys = append(keys, "explore")
-	case "explore":
-		keys = append(keys, "generalPurpose")
-	case "browserUse":
-		keys = append(keys, "browser-use")
-	case "browser-use":
-		keys = append(keys, "browserUse")
+	// Fallback: In Cursor Settings -> Models -> Task Models, users configure
+	// "Explore Subagent Model". In v3 runtime, all Task subagents without a specific
+	// override fall back to "explore", and then "generalPurpose".
+	for _, fallback := range []string{"explore", "generalPurpose"} {
+		appendCandidateKeyIfMissing(&keys, fallback)
 	}
 	return keys
+}
+
+func appendCandidateKeyIfMissing(keys *[]string, candidates ...string) {
+	for _, candidate := range candidates {
+		if !slices.Contains(*keys, candidate) {
+			*keys = append(*keys, candidate)
+		}
+	}
 }
 
 type RunState string
