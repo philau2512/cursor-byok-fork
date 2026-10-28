@@ -157,3 +157,78 @@ func TestSubagentTypeStringParsingCaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractRequestedContextTokensAndVariantString(t *testing.T) {
+	tests := []struct {
+		name       string
+		model      *agentv1.RequestedModel
+		wantTokens uint32
+		wantModel  string
+	}{
+		{
+			name: "parameter context 356k",
+			model: &agentv1.RequestedModel{
+				ModelId: "gpt-4o",
+				Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+					{Id: "context", Value: "356k"},
+					{Id: "reasoning", Value: "high"},
+				},
+			},
+			wantTokens: 356_000,
+			wantModel:  "gpt-4o",
+		},
+		{
+			name: "parameter context 1m",
+			model: &agentv1.RequestedModel{
+				ModelId: "gpt-4o",
+				Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+					{Id: "context", Value: "1m"},
+				},
+			},
+			wantTokens: 1_000_000,
+			wantModel:  "gpt-4o",
+		},
+		{
+			name: "parameter context numeric 500000",
+			model: &agentv1.RequestedModel{
+				ModelId: "claude-3-7-sonnet",
+				Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+					{Id: "context", Value: "500000"},
+				},
+			},
+			wantTokens: 500_000,
+			wantModel:  "claude-3-7-sonnet",
+		},
+		{
+			name: "variant string with bracket context and reasoning",
+			model: &agentv1.RequestedModel{
+				ModelId:                       "my-custom-model[context=356k,reasoning=high]",
+				IsVariantStringRepresentation: true,
+			},
+			wantTokens: 356_000,
+			wantModel:  "my-custom-model",
+		},
+		{
+			name: "legacy variant string colon reasoning",
+			model: &agentv1.RequestedModel{
+				ModelId:                       "my-custom-model:high",
+				IsVariantStringRepresentation: true,
+			},
+			wantTokens: 0,
+			wantModel:  "my-custom-model",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTokens := extractRequestedContextTokensFromRequestedModel(tc.model)
+			if gotTokens != tc.wantTokens {
+				t.Errorf("extractRequestedContextTokens = %v, want %v", gotTokens, tc.wantTokens)
+			}
+			gotModel := extractRequestedModelIDFromRequestedModel(tc.model)
+			if gotModel != tc.wantModel {
+				t.Errorf("extractRequestedModelID = %v, want %v", gotModel, tc.wantModel)
+			}
+		})
+	}
+}

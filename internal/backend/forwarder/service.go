@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -629,6 +631,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = extractRequestedModelID(message)
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.SubagentTypeName = strings.TrimSpace(runRequest.GetSubagentTypeName())
 		parsedOverrides := parseSubagentModelOverrides(runRequest.GetSubagentModelOverrides())
 		intent.SubagentModelOverrides = parsedOverrides.Overrides
@@ -672,6 +675,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = firstNonEmpty(extractRequestedModelID(message), "default")
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.ModelName = service.resolveRequestedModelName(message, intent.ModelID)
 	case "conversation_action":
 		action := message.GetConversationAction()
@@ -3350,6 +3354,24 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 	if effort := normalizeRuntimeThinkingEffort(text); effort != "" {
 		return "", effort
 	}
+	if idx := strings.Index(text, "["); idx > 0 {
+		modelID := strings.TrimSpace(text[:idx])
+		bracketContent := text[idx+1:]
+		if end := strings.Index(bracketContent, "]"); end >= 0 {
+			bracketContent = bracketContent[:end]
+		}
+		effort := ""
+		for _, part := range strings.Split(bracketContent, ",") {
+			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+			if len(kv) == 2 {
+				k := strings.ToLower(strings.TrimSpace(kv[0]))
+				if isRuntimeThinkingEffortParameterID(k) {
+					effort = normalizeRuntimeThinkingEffort(kv[1])
+				}
+			}
+		}
+		return modelID, effort
+	}
 	index := strings.LastIndex(text, ":")
 	if index <= 0 || index >= len(text)-1 {
 		return "", ""
@@ -3360,6 +3382,88 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 		return "", ""
 	}
 	return modelID, effort
+}
+
+func extractRequestedContextTokens(message *agentv1.AgentClientMessage) uint32 {
+	if message == nil {
+		return 0
+	}
+	if runRequest := message.GetRunRequest(); runRequest != nil {
+		return extractRequestedContextTokensFromRequestedModel(runRequest.GetRequestedModel())
+	}
+	if prewarm := message.GetPrewarmRequest(); prewarm != nil {
+		return extractRequestedContextTokensFromRequestedModel(prewarm.GetRequestedModel())
+	}
+	return 0
+}
+
+func extractRequestedContextTokensFromRequestedModel(model *agentv1.RequestedModel) uint32 {
+	if model == nil {
+		return 0
+	}
+	for _, parameter := range model.GetParameters() {
+		if parameter == nil {
+			continue
+		}
+		if isContextParameterID(parameter.GetId()) {
+			if tokens := parseContextTokenCount(parameter.GetValue()); tokens > 0 {
+				return tokens
+			}
+		}
+	}
+	if model.GetIsVariantStringRepresentation() {
+		text := strings.TrimSpace(model.GetModelId())
+		if idx := strings.Index(text, "["); idx > 0 {
+			bracketContent := text[idx+1:]
+			if end := strings.Index(bracketContent, "]"); end >= 0 {
+				bracketContent = bracketContent[:end]
+			}
+			for _, part := range strings.Split(bracketContent, ",") {
+				kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+				if len(kv) == 2 {
+					if isContextParameterID(kv[0]) {
+						if tokens := parseContextTokenCount(kv[1]); tokens > 0 {
+							return tokens
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func isContextParameterID(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "context", "context_window", "context_window_tokens", "contextwindowtokens", "context_size", "contextsize":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseContextTokenCount(value string) uint32 {
+	val := strings.ToLower(strings.TrimSpace(value))
+	if val == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(val, "k") {
+		multiplier = 1_000
+		val = strings.TrimSuffix(val, "k")
+	} else if strings.HasSuffix(val, "m") {
+		multiplier = 1_000_000
+		val = strings.TrimSuffix(val, "m")
+	}
+	num, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0
+	}
+	tokens := num * multiplier
+	if tokens > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(tokens)
 }
 
 func (service *Service) resolveRequestedModelName(message *agentv1.AgentClientMessage, modelID string) string {
@@ -3405,6 +3509,9 @@ func (service *Service) resolveContextWindowTokens(modelID string) uint32 {
 
 func (service *Service) syncConversationContextWindowTokens(stream *ActiveStream, conversationID string, conversation *ConversationFile) (*ConversationFile, error) {
 	if stream == nil || conversation == nil {
+		return conversation, nil
+	}
+	if conversation.TokenDetailsMaxTokens > 0 {
 		return conversation, nil
 	}
 	stream.mu.Lock()
