@@ -151,3 +151,32 @@ func TestShouldAutoResumeAfterCreatePlanInteraction(t *testing.T) {
 	}
 }
 
+func TestShouldMergeTodoUpdate_ExplicitFalseForNewTask(t *testing.T) {
+	args := &agentv1.UpdateTodosArgs{
+		Todos: []*agentv1.TodoItem{
+			{Id: "task-1", Content: "Task 1", Status: agentv1.TodoStatus_TODO_STATUS_PENDING},
+		},
+		Merge: false,
+	}
+	existing := []*agentv1.TodoItem{
+		{Id: "old-1", Content: "Old Task", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+	}
+	if shouldMergeTodoUpdate(args, true, existing) {
+		t.Fatal("expected shouldMergeTodoUpdate to return false when merge is explicitly false for new task")
+	}
+}
+
+func TestMissingActiveTodoReplacementIDs_CompletedOldTasks(t *testing.T) {
+	existing := []*agentv1.TodoItem{
+		{Id: "old-1", Content: "Old Task 1", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+		{Id: "old-2", Content: "Old Task 2", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+	}
+	newTodos := []*agentv1.TodoItem{
+		{Id: "new-1", Content: "New Task 1", Status: agentv1.TodoStatus_TODO_STATUS_PENDING},
+	}
+	missing := missingActiveTodoReplacementIDs(existing, newTodos)
+	if len(missing) > 0 {
+		t.Fatalf("expected no missing active ids when all existing tasks are completed, got: %v", missing)
+	}
+}
+

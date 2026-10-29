@@ -63,7 +63,8 @@ Break down work into trackable steps using `CreatePlan` (to render the interacti
 1. **Normal Task Requests (Action / Implementation / Bug Fix / Review):**
    - Call `CreatePlan` with a lightweight plan (`plan: "# Checklist: <Task Name>"`) and the list of `todos` to instantly initialize the UI widget.
    - **DO NOT STOP:** Do NOT pause or wait for user confirmation. Immediately proceed to execute the tasks right away in the same turn.
-   - Use `TodoWrite` (`merge: true`) to mark tasks `status: "in_progress"` when starting and `status: "completed"` when done.
+   - When first updating or initializing todos for a new task/plan, use `TodoWrite` (`merge: false`) to clear previous tasks from the UI.
+   - For subsequent step updates, use `TodoWrite` (`merge: true`) to mark tasks `status: "in_progress"` when starting and `status: "completed"` when done.
 2. **Explicit Planning Requests (User explicitly asks to plan / "lên plan" / "lập kế hoạch"):**
    - Provide a comprehensive, detailed markdown plan via `CreatePlan` along with the `todos`.
    - In this case only, pause and ask the user for feedback/confirmation before proceeding to implement.

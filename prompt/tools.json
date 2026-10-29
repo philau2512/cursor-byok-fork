@@ -540,12 +540,12 @@
     },
     {
       "function": {
-        "description": "Use this tool to manage and update the status of todos in the active checklist created by CreatePlan. When starting a task, set status='in_progress'. When finished, immediately set status='completed'. Always use merge=true to update items incrementally by id without overwriting the rest of the list.",
+        "description": "Use this tool to manage and update the status of todos in the active checklist. When starting a new task or plan, call TodoWrite with merge=false to clear previous tasks from the UI and initialize the new checklist. During execution, update task status with merge=true (set status='in_progress' when starting a step, and status='completed' when finished).",
         "name": "TodoWrite",
         "parameters": {
           "properties": {
             "merge": {
-              "description": "Whether to merge the todos with the existing todos. If true, the todos will be merged into the existing todos based on the id field. Use true for normal incremental updates, marking items complete, adding follow-ups, or changing the current in-progress item. If false, the new todos replace the entire list and must include every existing todo id once a list already exists.",
+              "description": "Whether to merge the todos with existing todos. IMPORTANT: Set merge=false when initializing a checklist for a new task or new plan to clear old tasks and replace the list. Set merge=true for incremental progress updates by id without overwriting the list.",
               "type": "boolean"
             },
             "todos": {
