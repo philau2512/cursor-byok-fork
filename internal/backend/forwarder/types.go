@@ -456,6 +456,7 @@ type InboundIntent struct {
 	ModelID                  string
 	ModelName                string
 	ThinkingEffort           string
+	RequestedContextTokens   uint32
 	Mode                     agentv1.AgentMode
 	HasExplicitMode          bool
 	ModeSource               ModeSource

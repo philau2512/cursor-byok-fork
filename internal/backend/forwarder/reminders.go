@@ -108,7 +108,7 @@ For this file, the latest source of truth is the most recent successful %s, not 
 
 When modifying this file:
 - use PatchEdit with path, old_string, new_string, and optional replace_all
-- copy old_string exactly from the latest file content; line endings are not normalized or treated equivalently during matching
+- copy old_string from the latest file content; line endings (CRLF and LF) are normalized and treated equivalently during matching
 - replace_all defaults to false, so old_string must match exactly one occurrence unless you intentionally set replace_all to true
 - new_string may be empty to delete old_string
 - preserve spaces, tabs, indentation, punctuation, and line endings exactly in old_string

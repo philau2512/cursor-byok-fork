@@ -49,6 +49,21 @@ func normalizeRealtimeRequestContextForStorage(requestContext *agentv1.RequestCo
 	}
 
 	normalized := &agentv1.RequestContext{}
+	if env := requestContext.GetEnv(); env != nil {
+		if clonedEnv, ok := proto.Clone(env).(*agentv1.RequestContextEnv); ok && clonedEnv != nil {
+			normalized.Env = clonedEnv
+		}
+	}
+	if repos := requestContext.GetGitRepos(); len(repos) > 0 {
+		normalized.GitRepos = make([]*agentv1.GitRepoInfo, 0, len(repos))
+		for _, repo := range repos {
+			if repo != nil {
+				if clonedRepo, ok := proto.Clone(repo).(*agentv1.GitRepoInfo); ok && clonedRepo != nil {
+					normalized.GitRepos = append(normalized.GitRepos, clonedRepo)
+				}
+			}
+		}
+	}
 	normalized.Rules = guardCursorRules(filterNonSkillRules(requestContext.GetRules()))
 	if fileContents := normalizeRealtimeFileContents(requestContext.GetFileContents()); len(fileContents) > 0 {
 		normalized.FileContents = fileContents
@@ -65,7 +80,7 @@ func normalizeRealtimeRequestContextForStorage(requestContext *agentv1.RequestCo
 	if pr := strings.TrimSpace(requestContext.GetPrAttributionMessage()); pr != "" {
 		normalized.PrAttributionMessage = stringPtr(truncatePromptGuardText("request_context.pr_attribution_message", pr, promptGuardRealtimeTextChars))
 	}
-	if !hasRealtimeRequestContextContent(normalized) {
+	if !hasRealtimeRequestContextContent(normalized) && normalized.Env == nil && len(normalized.GitRepos) == 0 {
 		return nil
 	}
 	return normalized

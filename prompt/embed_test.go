@@ -180,9 +180,6 @@ func TestToolsCatalogSingleSharedFile(t *testing.T) {
 	if len(catalog.Tools) == 0 {
 		t.Fatal("tools catalog has 0 tools")
 	}
-	if len(catalog.Variants) == 0 {
-		t.Fatal("tools catalog has 0 variants")
-	}
 
 	for _, mode := range []Mode{ModeAgent, ModeAsk, ModePlan, ModeDebug, ModeMultitask, ModeSubagent} {
 		path, err := ToolsPath(mode)

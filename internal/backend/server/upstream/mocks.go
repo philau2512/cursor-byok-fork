@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"html"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ const (
 	availableModelsUpgradeHours       = 2
 
 	modelRuntimeThinkingEffortParameterID = "thinking_effort"
+	modelRuntimeContextParameterID        = "context"
+	defaultContextFallbackValue           = "200k"
 
 	// localPathEncryptionKey — стабильный ключ шифрования путей для индексации
 	// репозитория, который cursor-agent CLI запрашивает через GetServerConfig
@@ -690,6 +693,7 @@ func buildAvailableModelEntries(adapters []legacyruntime.ModelAdapterConfig) []m
 			modelDisplayName = modelID
 		}
 		defaultThinkingEffort := defaultThinkingEffortForAdapter(adapter)
+		defaultContextValue, contextOptions := buildContextOptionsForAdapter(adapter)
 		output = append(output, map[string]any{
 			"clientDisplayName":                  displayName,
 			"defaultOn":                          true,
@@ -698,7 +702,7 @@ func buildAvailableModelEntries(adapters []legacyruntime.ModelAdapterConfig) []m
 			"isRecommendedForBackgroundComposer": false,
 			"name":                               channelID,
 			"namedModelSectionIndex":             1,
-			"parameterDefinitions":               buildThinkingEffortParameterDefinitions(adapter.Type),
+			"parameterDefinitions":               buildModelParameterDefinitions(adapter.Type, contextOptions),
 			"serverModelName":                    channelID,
 			"supportsAgent":                      true,
 			"supportsImages":                     true,
@@ -714,7 +718,7 @@ func buildAvailableModelEntries(adapters []legacyruntime.ModelAdapterConfig) []m
 			"tooltipDataForMaxMode": map[string]any{
 				"markdownContent": tooltipData,
 			},
-			"variants": buildThinkingEffortVariants(adapter.Type, channelID, modelDisplayName, tooltipData, defaultThinkingEffort),
+			"variants": buildModelVariants(adapter.Type, channelID, modelDisplayName, tooltipData, defaultThinkingEffort, defaultContextValue, contextOptions),
 		})
 	}
 	return output
@@ -741,7 +745,102 @@ func buildCLIModelDetails(adapters []legacyruntime.ModelAdapterConfig) []map[str
 	return models
 }
 
-func buildThinkingEffortParameterDefinitions(adapterType string) []map[string]any {
+type contextOptionItem struct {
+	Value       string
+	DisplayName string
+	Tokens      int
+}
+
+var standardContextPresets = []contextOptionItem{
+	{Value: "200k", DisplayName: "200K", Tokens: 200_000},
+	{Value: "356k", DisplayName: "356K", Tokens: 356_000},
+	{Value: "500k", DisplayName: "500K", Tokens: 500_000},
+	{Value: "800k", DisplayName: "800K", Tokens: 800_000},
+	{Value: "1m", DisplayName: "1M", Tokens: 1_000_000},
+}
+
+func formatTokenCountDisplay(tokens int) string {
+	if tokens >= 1_000_000 && tokens%1_000_000 == 0 {
+		return fmt.Sprintf("%dM", tokens/1_000_000)
+	}
+	if tokens >= 1_000 && tokens%1_000 == 0 {
+		return fmt.Sprintf("%dK", tokens/1_000)
+	}
+	return fmt.Sprintf("%d", tokens)
+}
+
+func buildContextOptionsForAdapter(adapter legacyruntime.ModelAdapterConfig) (string, []contextOptionItem) {
+	defaultValue := defaultContextFallbackValue
+	configuredTokens := adapter.ContextWindowTokens
+	hasCustom := false
+	var customOption contextOptionItem
+
+	if configuredTokens > 0 {
+		foundPreset := false
+		for _, preset := range standardContextPresets {
+			if preset.Tokens == configuredTokens {
+				defaultValue = preset.Value
+				foundPreset = true
+				break
+			}
+		}
+		if !foundPreset {
+			hasCustom = true
+			customVal := strings.ToLower(formatTokenCountDisplay(configuredTokens))
+			customOption = contextOptionItem{
+				Value:       customVal,
+				DisplayName: fmt.Sprintf("%s (Custom)", formatTokenCountDisplay(configuredTokens)),
+				Tokens:      configuredTokens,
+			}
+			defaultValue = customVal
+		}
+	}
+
+	options := make([]contextOptionItem, 0, len(standardContextPresets)+1)
+	if hasCustom {
+		options = append(options, customOption)
+		for _, preset := range standardContextPresets {
+			options = append(options, preset)
+		}
+	} else {
+		for _, preset := range standardContextPresets {
+			if preset.Value == defaultValue {
+				options = append([]contextOptionItem{preset}, options...)
+			} else {
+				options = append(options, preset)
+			}
+		}
+	}
+
+	return defaultValue, options
+}
+
+func buildModelParameterDefinitions(adapterType string, contextOptions []contextOptionItem) []map[string]any {
+	contextValues := make([]map[string]any, 0, len(contextOptions))
+	for _, opt := range contextOptions {
+		contextValues = append(contextValues, map[string]any{
+			"value":       opt.Value,
+			"displayName": opt.DisplayName,
+		})
+	}
+
+	contextParam := map[string]any{
+		"id":                  modelRuntimeContextParameterID,
+		"name":                "Context",
+		"markdownTooltip":     "Context size used to trigger conversation compaction.",
+		"isCycleableByHotkey": false,
+		"parameterType": map[string]any{
+			"enumParameter": map[string]any{
+				"values": contextValues,
+			},
+		},
+	}
+
+	effortParam := buildThinkingEffortParameterDefinition(adapterType)
+	return []map[string]any{contextParam, effortParam}
+}
+
+func buildThinkingEffortParameterDefinition(adapterType string) map[string]any {
 	values := thinkingEffortValuesForAdapter(adapterType)
 	options := make([]map[string]any, 0, len(values))
 	for _, value := range values {
@@ -751,7 +850,7 @@ func buildThinkingEffortParameterDefinitions(adapterType string) []map[string]an
 			"value":              value,
 		})
 	}
-	return []map[string]any{{
+	return map[string]any{
 		"id":                  modelRuntimeThinkingEffortParameterID,
 		"isCycleableByHotkey": true,
 		"markdownTooltip":     "Controls the model thinking intensity for this run.",
@@ -761,49 +860,86 @@ func buildThinkingEffortParameterDefinitions(adapterType string) []map[string]an
 				"values": options,
 			},
 		},
-	}}
+	}
 }
 
-func buildThinkingEffortVariants(adapterType string, channelID string, modelDisplayName string, tooltipData string, defaultThinkingEffort string) []map[string]any {
+func buildModelVariants(
+	adapterType string,
+	channelID string,
+	modelDisplayName string,
+	tooltipData string,
+	defaultThinkingEffort string,
+	defaultContext string,
+	contextOptions []contextOptionItem,
+) []map[string]any {
 	values := orderThinkingEffortValues(thinkingEffortValuesForAdapter(adapterType), defaultThinkingEffort)
 	channelID = strings.TrimSpace(channelID)
 	modelDisplayName = strings.TrimSpace(modelDisplayName)
-	variants := make([]map[string]any, 0, len(values))
-	for _, value := range values {
-		effortDisplayName := thinkingEffortDisplayName(value)
-		variantDisplayName := buildThinkingEffortVariantDisplayName(modelDisplayName, value)
-		variant := map[string]any{
-			"displayName":              variantDisplayName,
-			"displayNameOutsidePicker": variantDisplayName,
-			"isDefaultNonMaxConfig":    value == defaultThinkingEffort,
-			"isMaxMode":                false,
-			"parameterValues":          []map[string]any{{"id": modelRuntimeThinkingEffortParameterID, "value": value}},
+
+	variants := make([]map[string]any, 0, len(contextOptions)*len(values))
+	for _, ctx := range contextOptions {
+		for _, value := range values {
+			effortDisplayName := thinkingEffortDisplayName(value)
+			isDefault := ctx.Value == defaultContext && value == defaultThinkingEffort
+			variantDisplayName := buildModelVariantDisplayName(modelDisplayName, ctx.Value, ctx.DisplayName, defaultContext, value)
+
+			variant := map[string]any{
+				"displayName":              variantDisplayName,
+				"displayNameOutsidePicker": variantDisplayName,
+				"isDefaultNonMaxConfig":    isDefault,
+				"isMaxMode":                false,
+				"parameterValues": []map[string]any{
+					{"id": modelRuntimeContextParameterID, "value": ctx.Value},
+					{"id": modelRuntimeThinkingEffortParameterID, "value": value},
+				},
+			}
+
+			var taglineParts []string
+			if ctx.Value != defaultContext {
+				taglineParts = append(taglineParts, ctx.DisplayName)
+			}
+			if normalizeAvailableModelThinkingEffort(value, true, "") != "disabled" {
+				taglineParts = append(taglineParts, effortDisplayName)
+			}
+			if len(taglineParts) > 0 {
+				variant["tagline"] = strings.Join(taglineParts, " ")
+			}
+
+			if channelID != "" {
+				if ctx.Value == defaultContext {
+					variant["variantStringRepresentation"] = channelID + ":" + value
+				} else {
+					variant["variantStringRepresentation"] = fmt.Sprintf("%s[context=%s,reasoning=%s]", channelID, ctx.Value, value)
+				}
+			}
+
+			if strings.TrimSpace(tooltipData) != "" {
+				variant["tooltipData"] = map[string]any{"markdownContent": tooltipData}
+			}
+
+			variants = append(variants, variant)
 		}
-		if normalizeAvailableModelThinkingEffort(value, true, "") != "disabled" {
-			variant["tagline"] = effortDisplayName
-		}
-		if channelID != "" {
-			variant["variantStringRepresentation"] = channelID + ":" + value
-		}
-		if strings.TrimSpace(tooltipData) != "" {
-			variant["tooltipData"] = map[string]any{"markdownContent": tooltipData}
-		}
-		variants = append(variants, variant)
 	}
 	return variants
 }
 
-func buildThinkingEffortVariantDisplayName(modelDisplayName string, effortValue string) string {
-	modelDisplayName = html.EscapeString(strings.TrimSpace(modelDisplayName))
-	if normalizeAvailableModelThinkingEffort(effortValue, true, "") == "disabled" {
-		return modelDisplayName
+func buildModelVariantDisplayName(modelDisplayName string, contextValue string, contextDisplayName string, defaultContext string, effortValue string) string {
+	escapedModel := html.EscapeString(strings.TrimSpace(modelDisplayName))
+	var taglines []string
+	if contextValue != defaultContext {
+		taglines = append(taglines, html.EscapeString(contextDisplayName))
 	}
-	effortDisplayName := thinkingEffortDisplayName(effortValue)
-	effortDisplayName = html.EscapeString(strings.TrimSpace(effortDisplayName))
-	if modelDisplayName == "" {
-		return `<span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">:icon-brain: ` + effortDisplayName + `</span>`
+	if normalizeAvailableModelThinkingEffort(effortValue, true, "") != "disabled" {
+		taglines = append(taglines, ":icon-brain: "+html.EscapeString(thinkingEffortDisplayName(effortValue)))
 	}
-	return modelDisplayName + ` <span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">:icon-brain: ` + effortDisplayName + `</span>`
+	if len(taglines) == 0 {
+		return escapedModel
+	}
+	taglineStr := strings.Join(taglines, " ")
+	if escapedModel == "" {
+		return `<span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">` + taglineStr + `</span>`
+	}
+	return escapedModel + ` <span class="ui-model-picker__item-tagline" style="color: var(--cursor-text-secondary); white-space: nowrap;">` + taglineStr + `</span>`
 }
 
 func thinkingEffortValuesForAdapter(adapterType string) []string {

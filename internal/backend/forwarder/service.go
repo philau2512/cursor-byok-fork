@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +69,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 		if _, exists := parsed.Overrides[subagentType]; exists {
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "duplicate_overrides_previous"})
 		}
+		var parsedSelection runtimecore.SubagentModelOverrideSelection
 		switch selection := item.GetSelection().(type) {
 		case *agentv1.SubagentModelOverride_Model:
 			model := selection.Model
@@ -75,7 +78,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "empty_model_id"})
 				continue
 			}
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType:                  subagentType,
 				Selection:                     "model",
 				ModelID:                       modelID,
@@ -85,17 +88,30 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				IsVariantStringRepresentation: model.GetIsVariantStringRepresentation(),
 			}
 		case *agentv1.SubagentModelOverride_Inherit:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "inherit",
 			}
 		case *agentv1.SubagentModelOverride_Disabled:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "disabled",
 			}
 		default:
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "unknown_selection"})
+			continue
+		}
+		parsed.Overrides[subagentType] = parsedSelection
+		lower := strings.ToLower(subagentType)
+		if lower != subagentType {
+			if _, exists := parsed.Overrides[lower]; !exists {
+				parsed.Overrides[lower] = parsedSelection
+			}
+		}
+		if lower == "explorer" {
+			if _, exists := parsed.Overrides["explore"]; !exists {
+				parsed.Overrides["explore"] = parsedSelection
+			}
 		}
 	}
 	return parsed
@@ -133,7 +149,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 			effectiveModelID = ""
 		}
 	}
-	if effectiveModelID == "" && !disabled {
+	if (effectiveModelID == "" || effectiveModelID == "inherit" || effectiveModelID == "default" || effectiveModelID == "fast") && !disabled {
 		effectiveModelID = strings.TrimSpace(parentModelID)
 	}
 	payload := map[string]any{
@@ -615,6 +631,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = extractRequestedModelID(message)
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.SubagentTypeName = strings.TrimSpace(runRequest.GetSubagentTypeName())
 		parsedOverrides := parseSubagentModelOverrides(runRequest.GetSubagentModelOverrides())
 		intent.SubagentModelOverrides = parsedOverrides.Overrides
@@ -625,6 +642,13 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			"overrides":      subagentModelOverrideSummaries(parsedOverrides.Overrides),
 			"ignored":        parsedOverrides.Ignored,
 		})
+		if (intent.ModelID == "" || intent.ModelID == "default") && intent.SubagentTypeName != "" {
+			if override, _, ok := runtimecore.LookupSubagentModelOverride(intent.SubagentModelOverrides, intent.SubagentTypeName); ok {
+				if strings.TrimSpace(override.Selection) == "model" && strings.TrimSpace(override.ModelID) != "" {
+					intent.ModelID = strings.TrimSpace(override.ModelID)
+				}
+			}
+		}
 		if intent.ModelID == "" {
 			intent.ModelID = "default"
 		}
@@ -651,6 +675,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = firstNonEmpty(extractRequestedModelID(message), "default")
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.ModelName = service.resolveRequestedModelName(message, intent.ModelID)
 	case "conversation_action":
 		action := message.GetConversationAction()
@@ -1924,7 +1949,7 @@ func (service *Service) runProviderStream(stream *ActiveStream, token uint64, ct
 
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
-	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
+	if err := providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID); err != nil {
 		return err
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
@@ -1995,7 +2020,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	startedToolCall := buildStartedToolCall(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
-		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
+		return providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID)
 	}
 	if startedToolCall != nil {
 		if err := ensureLoopActive(); err != nil {
@@ -2918,23 +2943,76 @@ func extractPrependUserMessages(message *agentv1.AgentClientMessage) []*agentv1.
 	}
 }
 
-// extractRequestContext 从 legacy 请求中提取 request_context。
+// extractRequestContext 提取 request_context，优先兼容现代 Cursor 的 RequestContextParts.DynamicContext，
+// 并与 action 中可能包含的 legacy context 自动做防御性合并。
 func extractRequestContext(message *agentv1.AgentClientMessage) *agentv1.RequestContext {
 	if message == nil || message.GetRunRequest() == nil || message.GetRunRequest().GetAction() == nil {
 		return nil
 	}
-	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
+	action := message.GetRunRequest().GetAction()
+
+	var legacyContext *agentv1.RequestContext
+	switch item := action.GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetRequestContext()
+		legacyContext = item.UserMessageAction.GetRequestContext()
 	case *agentv1.ConversationAction_ResumeAction:
-		return item.ResumeAction.GetRequestContext()
+		legacyContext = item.ResumeAction.GetRequestContext()
 	case *agentv1.ConversationAction_StartPlanAction:
-		return item.StartPlanAction.GetRequestContext()
+		legacyContext = item.StartPlanAction.GetRequestContext()
 	case *agentv1.ConversationAction_ExecutePlanAction:
-		return item.ExecutePlanAction.GetRequestContext()
-	default:
-		return nil
+		legacyContext = item.ExecutePlanAction.GetRequestContext()
 	}
+
+	parts := action.GetRequestContextParts()
+	if parts != nil && parts.GetDynamicContext() != nil {
+		dynamic := parts.GetDynamicContext()
+		if legacyContext == nil {
+			return dynamic
+		}
+		return mergeRequestContexts(dynamic, legacyContext)
+	}
+	return legacyContext
+}
+
+func mergeRequestContexts(dynamic *agentv1.RequestContext, legacy *agentv1.RequestContext) *agentv1.RequestContext {
+	if dynamic == nil {
+		return legacy
+	}
+	if legacy == nil {
+		return dynamic
+	}
+	merged, ok := proto.Clone(dynamic).(*agentv1.RequestContext)
+	if !ok || merged == nil {
+		merged = dynamic
+	}
+	if merged.GetEnv() == nil && legacy.GetEnv() != nil {
+		merged.Env = legacy.GetEnv()
+	}
+	if len(merged.GetGitRepos()) == 0 && len(legacy.GetGitRepos()) > 0 {
+		merged.GitRepos = legacy.GetGitRepos()
+	}
+	if len(merged.GetAgentSkills()) == 0 && len(legacy.GetAgentSkills()) > 0 {
+		merged.AgentSkills = legacy.GetAgentSkills()
+	}
+	if merged.GetSkillOptions() == nil && legacy.GetSkillOptions() != nil {
+		merged.SkillOptions = legacy.GetSkillOptions()
+	}
+	if len(merged.GetCustomSubagents()) == 0 && len(legacy.GetCustomSubagents()) > 0 {
+		merged.CustomSubagents = legacy.GetCustomSubagents()
+	}
+	if len(merged.GetRules()) == 0 && len(legacy.GetRules()) > 0 {
+		merged.Rules = legacy.GetRules()
+	}
+	if len(merged.GetNonFileRules()) == 0 && len(legacy.GetNonFileRules()) > 0 {
+		merged.NonFileRules = legacy.GetNonFileRules()
+	}
+	if merged.GetMcpMetaToolOptions() == nil && legacy.GetMcpMetaToolOptions() != nil {
+		merged.McpMetaToolOptions = legacy.GetMcpMetaToolOptions()
+	}
+	if merged.GetMcpFileSystemOptions() == nil && legacy.GetMcpFileSystemOptions() != nil {
+		merged.McpFileSystemOptions = legacy.GetMcpFileSystemOptions()
+	}
+	return merged
 }
 
 func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runRequest *agentv1.AgentRunRequest, userMessage *agentv1.UserMessage, requestContext *agentv1.RequestContext) bool {
@@ -3276,6 +3354,24 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 	if effort := normalizeRuntimeThinkingEffort(text); effort != "" {
 		return "", effort
 	}
+	if idx := strings.Index(text, "["); idx > 0 {
+		modelID := strings.TrimSpace(text[:idx])
+		bracketContent := text[idx+1:]
+		if end := strings.Index(bracketContent, "]"); end >= 0 {
+			bracketContent = bracketContent[:end]
+		}
+		effort := ""
+		for _, part := range strings.Split(bracketContent, ",") {
+			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+			if len(kv) == 2 {
+				k := strings.ToLower(strings.TrimSpace(kv[0]))
+				if isRuntimeThinkingEffortParameterID(k) {
+					effort = normalizeRuntimeThinkingEffort(kv[1])
+				}
+			}
+		}
+		return modelID, effort
+	}
 	index := strings.LastIndex(text, ":")
 	if index <= 0 || index >= len(text)-1 {
 		return "", ""
@@ -3286,6 +3382,88 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 		return "", ""
 	}
 	return modelID, effort
+}
+
+func extractRequestedContextTokens(message *agentv1.AgentClientMessage) uint32 {
+	if message == nil {
+		return 0
+	}
+	if runRequest := message.GetRunRequest(); runRequest != nil {
+		return extractRequestedContextTokensFromRequestedModel(runRequest.GetRequestedModel())
+	}
+	if prewarm := message.GetPrewarmRequest(); prewarm != nil {
+		return extractRequestedContextTokensFromRequestedModel(prewarm.GetRequestedModel())
+	}
+	return 0
+}
+
+func extractRequestedContextTokensFromRequestedModel(model *agentv1.RequestedModel) uint32 {
+	if model == nil {
+		return 0
+	}
+	for _, parameter := range model.GetParameters() {
+		if parameter == nil {
+			continue
+		}
+		if isContextParameterID(parameter.GetId()) {
+			if tokens := parseContextTokenCount(parameter.GetValue()); tokens > 0 {
+				return tokens
+			}
+		}
+	}
+	if model.GetIsVariantStringRepresentation() {
+		text := strings.TrimSpace(model.GetModelId())
+		if idx := strings.Index(text, "["); idx > 0 {
+			bracketContent := text[idx+1:]
+			if end := strings.Index(bracketContent, "]"); end >= 0 {
+				bracketContent = bracketContent[:end]
+			}
+			for _, part := range strings.Split(bracketContent, ",") {
+				kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+				if len(kv) == 2 {
+					if isContextParameterID(kv[0]) {
+						if tokens := parseContextTokenCount(kv[1]); tokens > 0 {
+							return tokens
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func isContextParameterID(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "context", "context_window", "context_window_tokens", "contextwindowtokens", "context_size", "contextsize":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseContextTokenCount(value string) uint32 {
+	val := strings.ToLower(strings.TrimSpace(value))
+	if val == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(val, "k") {
+		multiplier = 1_000
+		val = strings.TrimSuffix(val, "k")
+	} else if strings.HasSuffix(val, "m") {
+		multiplier = 1_000_000
+		val = strings.TrimSuffix(val, "m")
+	}
+	num, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0
+	}
+	tokens := num * multiplier
+	if tokens > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(tokens)
 }
 
 func (service *Service) resolveRequestedModelName(message *agentv1.AgentClientMessage, modelID string) string {
@@ -3331,6 +3509,9 @@ func (service *Service) resolveContextWindowTokens(modelID string) uint32 {
 
 func (service *Service) syncConversationContextWindowTokens(stream *ActiveStream, conversationID string, conversation *ConversationFile) (*ConversationFile, error) {
 	if stream == nil || conversation == nil {
+		return conversation, nil
+	}
+	if conversation.TokenDetailsMaxTokens > 0 {
 		return conversation, nil
 	}
 	stream.mu.Lock()

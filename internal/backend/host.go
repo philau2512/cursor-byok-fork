@@ -6,7 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +23,6 @@ import (
 )
 
 const healthPath = "/healthz"
-
-const tabServerBaseURL = "https://tab.leokun.cn"
 
 type Host struct {
 	store            *serverconfig.Store
@@ -460,16 +458,16 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 				StatusCode: http.StatusOK,
 			})),
 		),
-		tabServerProcedure("/aiserver.v1.AiService/StreamCpp", "ai_stream_cpp", server.ConnectStream(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/StreamNextCursorPrediction", "ai_stream_next_cursor_prediction", server.ConnectStream(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/GetCppEditClassification", "ai_get_cpp_edit_classification", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/RefreshTabContext", "ai_refresh_tab_context", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/CppConfig", "ai_cpp_config", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/CppEditHistoryStatus", "ai_cpp_edit_history_status", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/CppAppend", "ai_cpp_append", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/CppEditHistoryAppend", "ai_cpp_edit_history_append", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/ReportAiCodeChangeMetrics", "ai_report_ai_code_change_metrics", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.AiService/WriteGitBranchName", "ai_write_git_branch_name", server.ConnectUnary(), routeDeps),
+		emptyConnectStreamProcedure("/aiserver.v1.AiService/StreamCpp", "ai_stream_cpp"),
+		emptyConnectStreamProcedure("/aiserver.v1.AiService/StreamNextCursorPrediction", "ai_stream_next_cursor_prediction"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/GetCppEditClassification", "ai_get_cpp_edit_classification"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/RefreshTabContext", "ai_refresh_tab_context"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/CppConfig", "ai_cpp_config"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/CppEditHistoryStatus", "ai_cpp_edit_history_status"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/CppAppend", "ai_cpp_append"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/CppEditHistoryAppend", "ai_cpp_edit_history_append"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/ReportAiCodeChangeMetrics", "ai_report_ai_code_change_metrics"),
+		emptyConnectUnaryProcedure("/aiserver.v1.AiService/WriteGitBranchName", "ai_write_git_branch_name"),
 		repositoryServiceProcedure(forwarder.RepositoryServiceFastRepoInitHandshakeV2Procedure, "repository_fast_repo_init_handshake_v2", server.ConnectUnary(), agentModule),
 		repositoryServiceProcedure(forwarder.RepositoryServiceFastRepoInitHandshakeProcedure, "repository_fast_repo_init_handshake", server.ConnectUnary(), agentModule),
 		repositoryServiceProcedure(forwarder.RepositoryServiceFastRepoSyncCompleteProcedure, "repository_fast_repo_sync_complete", server.ConnectUnary(), agentModule),
@@ -494,8 +492,17 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 			server.HTTP(),
 			server.Local(server.HTTPHandlerAction(agentModule.AiHandler)),
 		),
-		tabServerProcedure("/aiserver.v1.CppService/AvailableModels", "cpp_available_models", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.CppService/RecordCppFate", "cpp_record_cpp_fate", server.ConnectUnary(), routeDeps),
+		server.POST("/aiserver.v1.CppService/AvailableModels",
+			server.Name("cpp_available_models"),
+			server.ConnectUnary(),
+			server.Local(upstream.MockProtoAction(routeDeps, upstream.CompatRouteConfig{
+				Name:          "cpp_available_models",
+				StatusCode:    http.StatusOK,
+				MockProtoType: "aiserver.v1.AvailableModelsResponse",
+				MockBuilder:   upstream.AvailableModelsMockBuilder,
+			})),
+		),
+		emptyConnectUnaryProcedure("/aiserver.v1.CppService/RecordCppFate", "cpp_record_cpp_fate"),
 		server.Any("/aiserver.v1.CppService/*",
 			server.Name("cpp_service"),
 			server.HTTP(),
@@ -504,10 +511,10 @@ func (host *Host) rebuildLocked(cfg serverconfig.Config) error {
 				return nil
 			}),
 		),
-		tabServerProcedure("/aiserver.v1.FileSyncService/FSSyncFile", "file_sync_sync_file", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.FileSyncService/FSIsEnabledForUser", "file_sync_is_enabled_for_user", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.FileSyncService/FSConfig", "file_sync_config", server.ConnectUnary(), routeDeps),
-		tabServerProcedure("/aiserver.v1.FileSyncService/FSUploadFile", "file_sync_upload_file", server.ConnectUnary(), routeDeps),
+		emptyConnectUnaryProcedure("/aiserver.v1.FileSyncService/FSSyncFile", "file_sync_sync_file"),
+		emptyConnectUnaryProcedure("/aiserver.v1.FileSyncService/FSIsEnabledForUser", "file_sync_is_enabled_for_user"),
+		emptyConnectUnaryProcedure("/aiserver.v1.FileSyncService/FSConfig", "file_sync_config"),
+		emptyConnectUnaryProcedure("/aiserver.v1.FileSyncService/FSUploadFile", "file_sync_upload_file"),
 		server.Any("/aiserver.v1.FileSyncService/*",
 			server.Name("file_sync"),
 			server.HTTP(),
@@ -811,25 +818,61 @@ func uploadServiceProcedure(pattern string, name string, protocol server.RouteOp
 	)
 }
 
-func tabServerProcedure(pattern string, name string, protocol server.RouteOption, deps upstream.Dependencies) server.Option {
-	forward := upstream.ForwardAction(deps, upstream.CompatRouteConfig{Name: name})
-	action := func(ctx *server.Context) error {
-		if ctx != nil && ctx.Request != nil && ctx.Request.URL != nil {
-			baseURL, err := url.Parse(tabServerBaseURL)
-			if err != nil {
-				return fmt.Errorf("解析 tab server 地址失败: %w", err)
-			}
-			targetURL := *ctx.Request.URL
-			targetURL.Scheme = baseURL.Scheme
-			targetURL.Host = baseURL.Host
-			ctx.UpstreamURL = &targetURL
+func emptyConnectStreamHandler() server.HandlerFunc {
+	return func(ctx *server.Context) error {
+		if ctx == nil || ctx.Writer == nil {
+			return nil
 		}
-		return forward(ctx)
+		header := ctx.Writer.Header()
+		if ctx.Request != nil && strings.Contains(ctx.Request.Header.Get("content-type"), "json") {
+			header.Set("content-type", "application/connect+json")
+		} else {
+			header.Set("content-type", "application/connect+proto")
+		}
+		header.Set("connect-protocol-version", "1")
+		// Connect end-of-stream envelope: flag=0x02, length=2, payload="{}"
+		endStreamPayload := []byte{0x02, 0x00, 0x00, 0x00, 0x02, '{', '}'}
+		header.Set("content-length", strconv.Itoa(len(endStreamPayload)))
+		ctx.Writer.WriteHeader(http.StatusOK)
+		_, _ = ctx.Writer.Write(endStreamPayload)
+		return nil
 	}
+}
+
+func emptyConnectUnaryHandler() server.HandlerFunc {
+	return func(ctx *server.Context) error {
+		if ctx == nil || ctx.Writer == nil {
+			return nil
+		}
+		header := ctx.Writer.Header()
+		header.Set("connect-protocol-version", "1")
+		if ctx.Request != nil && strings.Contains(ctx.Request.Header.Get("content-type"), "json") {
+			header.Set("content-type", "application/json")
+			header.Set("content-length", "2")
+			ctx.Writer.WriteHeader(http.StatusOK)
+			_, _ = ctx.Writer.Write([]byte("{}"))
+			return nil
+		}
+		header.Set("content-type", "application/proto")
+		header.Set("content-length", "0")
+		ctx.Writer.WriteHeader(http.StatusOK)
+		return nil
+	}
+}
+
+func emptyConnectStreamProcedure(pattern string, name string) server.Option {
 	return server.POST(pattern,
 		server.Name(name),
-		protocol,
-		server.Local(action),
+		server.ConnectStream(),
+		server.Local(emptyConnectStreamHandler()),
+	)
+}
+
+func emptyConnectUnaryProcedure(pattern string, name string) server.Option {
+	return server.POST(pattern,
+		server.Name(name),
+		server.ConnectUnary(),
+		server.Local(emptyConnectUnaryHandler()),
 	)
 }
 

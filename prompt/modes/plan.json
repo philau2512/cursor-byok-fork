@@ -1,42 +1,26 @@
 {
   "tools": [
-    "Shell",
-    "AwaitShell",
-    {
-      "name": "WriteShellStdin",
-      "variant": "plan"
-    },
-    "ForceBackgroundShell",
+    "AskQuestion",
+    "CallMcpTool",
+    "Delete",
+    "FetchMcpResource",
     "Glob",
     "Grep",
     "Read",
     "Ls",
-    "TodoWrite",
     "ReadLints",
-    "WebSearch",
+    "Shell",
+    "AwaitShell",
+    "WriteShellStdin",
+    "ForceBackgroundShell",
+    "PatchEdit",
+    "SwitchMode",
+    "Task",
+    "TodoWrite",
     "WebFetch",
-    "AskQuestion",
-    {
-      "name": "CreatePlan",
-      "variant": "plan"
-    },
-    {
-      "name": "Task",
-      "variant": "plan"
-    },
-    "FetchMcpResource",
-    {
-      "name": "Delete",
-      "variant": "plan"
-    },
-    {
-      "name": "PatchEdit",
-      "variant": "plan"
-    },
-    {
-      "name": "Write",
-      "variant": "plan"
-    },
-    "CallMcpTool"
+    "WebSearch",
+    "CreatePlan",
+    "Write",
+    "GenerateImage"
   ]
 }
