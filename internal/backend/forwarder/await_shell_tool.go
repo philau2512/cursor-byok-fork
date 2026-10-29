@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -72,20 +73,54 @@ func (service *Service) handleAwaitShellToolInvocation(stream *ActiveStream, inv
 	return service.completeImmediateToolResult(stream, invocation, string(payload), buildAwaitShellToolCall(buildAwaitArgsFromAwaitShellArgs(args), buildAwaitShellProtoResult(result)))
 }
 
+func readShellIDArg(argsMap map[string]any, keys ...string) string {
+	for _, key := range keys {
+		val, ok := argsMap[key]
+		if !ok || val == nil {
+			continue
+		}
+		switch v := val.(type) {
+		case string:
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		case float64:
+			return strconv.FormatUint(uint64(v), 10)
+		case float32:
+			return strconv.FormatUint(uint64(v), 10)
+		case int:
+			return strconv.Itoa(v)
+		case int64:
+			return strconv.FormatInt(v, 10)
+		case int32:
+			return strconv.FormatInt(int64(v), 10)
+		case uint:
+			return strconv.FormatUint(uint64(v), 10)
+		case uint64:
+			return strconv.FormatUint(v, 10)
+		case uint32:
+			return strconv.FormatUint(uint64(v), 10)
+		case json.Number:
+			return v.String()
+		}
+	}
+	return ""
+}
+
 func decodeAwaitShellArgs(raw []byte) (awaitShellArgs, error) {
 	argsMap, err := runtimecore.DecodeArgsMap(raw)
 	if err != nil {
 		return awaitShellArgs{}, fmt.Errorf("decode AwaitShell args failed: %w", err)
 	}
 	result := awaitShellArgs{
-		ShellID: strings.TrimSpace(runtimecore.ReadStringArg(argsMap, "shell_id")),
-		TaskID:  strings.TrimSpace(runtimecore.ReadStringArg(argsMap, "task_id")),
-		Pattern: strings.TrimSpace(runtimecore.ReadStringArg(argsMap, "pattern")),
+		ShellID: readShellIDArg(argsMap, "shell_id", "shellId", "id"),
+		TaskID:  readShellIDArg(argsMap, "task_id", "taskId"),
+		Pattern: strings.TrimSpace(runtimecore.ReadStringArg(argsMap, "pattern", "regex")),
 	}
 	if result.ShellID == "" {
 		result.ShellID = result.TaskID
 	}
-	if value, found, err := runtimecore.ReadInt64Arg(argsMap, "block_until_ms"); err != nil {
+	if value, found, err := runtimecore.ReadInt64Arg(argsMap, "block_until_ms", "blockUntilMs", "timeout_ms", "timeoutMs"); err != nil {
 		return result, err
 	} else if found {
 		if value < 0 {
@@ -307,6 +342,7 @@ type terminalShellFileSnapshot struct {
 	PID       *uint32
 	Command   string
 	CWD       string
+	Status    string
 	StartedAt time.Time
 	Output    string
 	ExitCode  *int32
@@ -344,7 +380,7 @@ func (service *Service) refreshBackgroundShellFromTerminalFile(stream *ActiveStr
 	if state.CreatedAt.IsZero() {
 		state.CreatedAt = firstNonZeroTime(terminalSnapshot.StartedAt, now)
 	}
-	if state.StdoutBuffer == "" && state.StderrBuffer == "" && terminalSnapshot.Output != "" {
+	if terminalSnapshot.Output != "" && (len(terminalSnapshot.Output) >= len(state.StdoutBuffer) || state.StdoutBuffer == "") {
 		state.StdoutBuffer = terminalSnapshot.Output
 		if !isBackgroundShellTerminalStatus(state.Status) {
 			state.Status = backgroundShellStatusRunning
@@ -357,6 +393,21 @@ func (service *Service) refreshBackgroundShellFromTerminalFile(stream *ActiveStr
 		state.Status = backgroundShellStatusCompleted
 		state.CompletedAt = firstNonZeroTime(terminalSnapshot.EndedAt, now)
 		state.LastActivityAt = state.CompletedAt
+	} else if !isBackgroundShellTerminalStatus(state.Status) {
+		switch terminalSnapshot.Status {
+		case "succeeded", "success", "completed", "done":
+			zero := int32(0)
+			state.ExitCode = &zero
+			state.Status = backgroundShellStatusCompleted
+			state.CompletedAt = firstNonZeroTime(terminalSnapshot.EndedAt, now)
+			state.LastActivityAt = state.CompletedAt
+		case "failed", "error":
+			one := int32(1)
+			state.ExitCode = &one
+			state.Status = backgroundShellStatusCompleted
+			state.CompletedAt = firstNonZeroTime(terminalSnapshot.EndedAt, now)
+			state.LastActivityAt = state.CompletedAt
+		}
 	}
 	if strings.TrimSpace(state.Status) == "" {
 		state.Status = backgroundShellStatusBackgrounded
@@ -384,12 +435,18 @@ func terminalShellFilePath(terminalsFolder string, shellID string) (string, bool
 	if folder == "." || !filepath.IsAbs(folder) {
 		return "", false
 	}
-	id, err := strconv.ParseUint(strings.TrimSpace(shellID), 10, 32)
-	if err != nil {
+	trimmedID := strings.TrimSpace(shellID)
+	if trimmedID == "" {
 		return "", false
 	}
-	filename := strconv.FormatUint(id, 10) + ".txt"
-	return filepath.Join(folder, filename), true
+	if id, err := strconv.ParseUint(trimmedID, 10, 32); err == nil {
+		filename := strconv.FormatUint(id, 10) + ".txt"
+		return filepath.Join(folder, filename), true
+	}
+	if strings.HasSuffix(strings.ToLower(trimmedID), ".txt") {
+		return filepath.Join(folder, filepath.Base(trimmedID)), true
+	}
+	return filepath.Join(folder, filepath.Base(trimmedID)+".txt"), true
 }
 
 func parseTerminalShellFileSnapshot(raw string) terminalShellFileSnapshot {
@@ -406,7 +463,7 @@ func parseTerminalShellFileSnapshot(raw string) terminalShellFileSnapshot {
 	outputEnd := len(lines)
 	for index := len(separators) - 2; index >= 1; index-- {
 		block := lines[separators[index]+1 : separators[index+1]]
-		if terminalMetadataBlockHasKey(block, "exit_code") || terminalMetadataBlockHasKey(block, "ended_at") {
+		if terminalMetadataBlockHasAnyKey(block, "exit_code", "last_exit_code", "ended_at", "status") {
 			parseTerminalShellMetadata(block, &snapshot)
 			outputEnd = separators[index]
 			break
@@ -438,7 +495,7 @@ func parseTerminalShellMetadata(lines []string, snapshot *terminalShellFileSnaps
 		if !ok {
 			continue
 		}
-		key = strings.TrimSpace(key)
+		key = strings.ToLower(strings.TrimSpace(key))
 		value = parseTerminalShellMetadataValue(value)
 		switch key {
 		case "pid":
@@ -448,17 +505,32 @@ func parseTerminalShellMetadata(lines []string, snapshot *terminalShellFileSnaps
 			}
 		case "cwd":
 			snapshot.CWD = value
-		case "command":
-			snapshot.Command = value
+		case "command", "last_command":
+			if snapshot.Command == "" {
+				snapshot.Command = value
+			}
 		case "started_at":
 			snapshot.StartedAt = parseTerminalShellTime(value)
-		case "exit_code":
+		case "exit_code", "last_exit_code":
 			if parsed, err := strconv.ParseInt(value, 10, 32); err == nil {
 				exitCode := int32(parsed)
 				snapshot.ExitCode = &exitCode
 			}
 		case "ended_at":
 			snapshot.EndedAt = parseTerminalShellTime(value)
+		case "status":
+			statusVal := strings.ToLower(strings.TrimSpace(value))
+			snapshot.Status = statusVal
+			if snapshot.ExitCode == nil {
+				switch statusVal {
+				case "succeeded", "success", "completed", "done":
+					zero := int32(0)
+					snapshot.ExitCode = &zero
+				case "failed", "error":
+					one := int32(1)
+					snapshot.ExitCode = &one
+				}
+			}
 		}
 	}
 }
@@ -479,11 +551,14 @@ func parseTerminalShellTime(value string) time.Time {
 	return parsed.UTC()
 }
 
-func terminalMetadataBlockHasKey(lines []string, key string) bool {
+func terminalMetadataBlockHasAnyKey(lines []string, keys ...string) bool {
 	for _, line := range lines {
 		current, _, ok := strings.Cut(line, ":")
-		if ok && strings.TrimSpace(current) == key {
-			return true
+		if ok {
+			trimmed := strings.ToLower(strings.TrimSpace(current))
+			if slices.Contains(keys, trimmed) {
+				return true
+			}
 		}
 	}
 	return false

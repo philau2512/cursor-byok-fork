@@ -1,6 +1,8 @@
 package forwarder
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +201,70 @@ func TestForceBackgroundShellDuplicateResultCompletesOnce(t *testing.T) {
 	}
 	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 1 {
 		t.Fatalf("duplicate force background result emitted %d completions, want 1", completions)
+	}
+}
+
+func TestDecodeAwaitShellArgsAcceptsNumericAndStringShellID(t *testing.T) {
+	testCases := []struct {
+		name   string
+		raw    string
+		wantID string
+		wantMS int64
+	}{
+		{name: "number id", raw: `{"shell_id":4,"block_until_ms":30000}`, wantID: "4", wantMS: 30000},
+		{name: "string id", raw: `{"shell_id":"4","block_until_ms":12000}`, wantID: "4", wantMS: 12000},
+		{name: "camel case shellId", raw: `{"shellId":7}`, wantID: "7", wantMS: 0},
+		{name: "task_id fallback", raw: `{"task_id":42}`, wantID: "42", wantMS: 0},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := decodeAwaitShellArgs([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("decodeAwaitShellArgs() error = %v", err)
+			}
+			if args.ShellID != tc.wantID {
+				t.Fatalf("args.ShellID = %q, want %q", args.ShellID, tc.wantID)
+			}
+			if tc.wantMS > 0 && (args.BlockUntilMS == nil || *args.BlockUntilMS != tc.wantMS) {
+				t.Fatalf("args.BlockUntilMS = %v, want %d", args.BlockUntilMS, tc.wantMS)
+			}
+		})
+	}
+}
+
+func TestRefreshBackgroundShellFromTerminalFileWithLastExitCodeAndStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	terminalContent := `---
+pid: 28948
+cwd: C:\workspace
+last_command: gradle compileJava
+last_exit_code: 0
+status: succeeded
+---
+BUILD SUCCESSFUL in 38s
+1 actionable task: 1 executed
+`
+	if err := os.WriteFile(filepath.Join(tempDir, "4.txt"), []byte(terminalContent), 0o644); err != nil {
+		t.Fatalf("failed to write mock terminal file: %v", err)
+	}
+
+	service, stream, _ := testShellRecoveryFixture(t, "opened")
+	stream.mu.Lock()
+	stream.TerminalsFolder = tempDir
+	stream.mu.Unlock()
+
+	result := service.awaitShellSnapshot(stream, awaitShellArgs{ShellID: "4", BlockUntilMS: int64Pointer(30000)})
+	if result.Status != backgroundShellStatusCompleted {
+		t.Fatalf("result.Status = %q, want %q", result.Status, backgroundShellStatusCompleted)
+	}
+	if result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("result.ExitCode = %v, want 0", result.ExitCode)
+	}
+	if result.TimedOut {
+		t.Fatal("result.TimedOut = true, want false (should complete immediately)")
+	}
+	if !strings.Contains(result.Stdout, "BUILD SUCCESSFUL in 38s") {
+		t.Fatalf("result.Stdout = %q, want containing build output", result.Stdout)
 	}
 }

@@ -42,7 +42,7 @@ They also contain the full terminal output as it was at the time the file was wr
 
 To quickly see metadata for all terminals without reading each file fully, you can run `head -n 10 *.txt` in the terminals folder, since the first ~10 lines of each file always contain the metadata (pid, cwd, last command, exit code).
 
-If you need to read the full terminal output, you can read the terminal file directly.
+If you need to read the full terminal output or verify whether a background command finished, you can proactively read the terminal file directly with Read (<terminals_folder>/$id.txt). If the file shows the command completed (e.g. exit_code/last_exit_code or status: succeeded), proceed immediately without repeated polling.
 
 <example what="output of file read tool call to 1.txt in the terminals folder">---
 pid: 68861
