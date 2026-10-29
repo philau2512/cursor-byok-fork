@@ -370,6 +370,8 @@ func (service *Service) handleHiddenPatchEditExecControl(stream *ActiveStream, p
 		return nil
 	}
 	if _, ok := message.GetMessage().(*agentv1.ExecClientControlMessage_StreamClose); ok {
+		markExecTransportClosed(stream, pending)
+		service.scheduleNonStreamingExecRecovery(stream.RequestID, pending)
 		return nil
 	}
 	payload, err := decodePendingPatchEditPayload(pending.ArgsJSON)
@@ -497,8 +499,8 @@ func decodePatchEditArgs(raw []byte) (patchEditArgs, error) {
 	replaceAll, replaceAllFound, replaceAllValid := readJSONBoolAny(rawArgs, "replace_all", "replaceAll", "ReplaceAll")
 	result := patchEditArgs{
 		Path:          path,
-		OldString:     oldString,
-		NewString:     newString,
+		OldString:     normalizeLineEndingsToLF(oldString),
+		NewString:     normalizeLineEndingsToLF(newString),
 		NewStringSet:  newFound,
 		ReplaceAll:    replaceAll,
 		ReplaceAllSet: replaceAllFound,
@@ -525,19 +527,21 @@ func decodePatchEditArgs(raw []byte) (patchEditArgs, error) {
 }
 
 func computePatchEdit(payload pendingPatchEditPayload, beforeContent string) (editComputation, error) {
-	args := payload.Args
-	occurrences := strings.Count(beforeContent, args.OldString)
+	beforeContent = normalizeLineEndingsToLF(beforeContent)
+	oldString := normalizeLineEndingsToLF(payload.Args.OldString)
+	newString := normalizeLineEndingsToLF(payload.Args.NewString)
+	occurrences := strings.Count(beforeContent, oldString)
 	switch {
 	case occurrences == 0:
 		return editComputation{}, fmt.Errorf("PatchEdit old_string not found")
-	case occurrences > 1 && !args.ReplaceAll:
+	case occurrences > 1 && !payload.Args.ReplaceAll:
 		return editComputation{}, fmt.Errorf("PatchEdit old_string is not unique; found %d occurrences", occurrences)
 	}
 	replaceCount := 1
-	if args.ReplaceAll {
+	if payload.Args.ReplaceAll {
 		replaceCount = -1
 	}
-	afterContent := strings.Replace(beforeContent, args.OldString, args.NewString, replaceCount)
+	afterContent := strings.Replace(beforeContent, oldString, newString, replaceCount)
 	diffString, linesAdded, linesRemoved := computeEditDiff(beforeContent, afterContent)
 	return editComputation{
 		BeforeContent: beforeContent,
@@ -656,17 +660,7 @@ func summarizePatchEditResult(path string, result *agentv1.EditResult) string {
 }
 
 func compactPatchEditHistoryEditResult(path string, result *agentv1.EditResult) *agentv1.EditResult {
-	success := result.GetSuccess()
-	if success == nil {
-		return editResultWithoutPath(result)
-	}
-	return &agentv1.EditResult{
-		Result: &agentv1.EditResult_Success{
-			Success: &agentv1.EditSuccess{
-				Path: firstNonEmpty(success.GetPath(), path),
-			},
-		},
-	}
+	return compactEditHistoryResult(path, result, projectedPatchEditReplayLimit)
 }
 
 func boundedPatchEditDiffString(diffString string) string {
@@ -708,8 +702,8 @@ func (args *patchEditArgs) UnmarshalJSON(raw []byte) error {
 	}
 	*args = patchEditArgs{
 		Path:          path,
-		OldString:     oldString,
-		NewString:     newString,
+		OldString:     normalizeLineEndingsToLF(oldString),
+		NewString:     normalizeLineEndingsToLF(newString),
 		NewStringSet:  newFound,
 		ReplaceAll:    replaceAll,
 		ReplaceAllSet: replaceAllFound,

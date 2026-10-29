@@ -133,3 +133,72 @@ func TestBuildBootstrapStatsigConfigJSONEnablesTerminalOutputUIStreaming(t *test
 		t.Fatalf("unexpected rule_id: %q", ruleID)
 	}
 }
+
+func TestBuildAvailableModelEntriesIncludesContextPresetsAndCustom(t *testing.T) {
+	adapters := []legacyruntime.ModelAdapterConfig{
+		{
+			ID:                  "standard-model",
+			DisplayName:         "Standard Model",
+			ModelID:             "gpt-4o",
+			Type:                "openai",
+			ContextWindowTokens: 0,
+		},
+		{
+			ID:                  "custom-model",
+			DisplayName:         "Custom Model",
+			ModelID:             "claude-3-7-sonnet",
+			Type:                "anthropic",
+			ContextWindowTokens: 356000,
+		},
+		{
+			ID:                  "arbitrary-model",
+			DisplayName:         "Arbitrary Model",
+			ModelID:             "deepseek-r1",
+			Type:                "openai",
+			ContextWindowTokens: 128000,
+		},
+	}
+
+	entries := buildAvailableModelEntries(adapters)
+	if len(entries) != 3 {
+		t.Fatalf("entry count = %d, want 3", len(entries))
+	}
+
+	// 1. Standard model should have context parameter with 200k, 356k, 500k, 800k, 1m
+	standardParams, ok := entries[0]["parameterDefinitions"].([]map[string]any)
+	if !ok || len(standardParams) < 2 {
+		t.Fatalf("standard parameterDefinitions = %#v", entries[0]["parameterDefinitions"])
+	}
+	if standardParams[0]["id"] != "context" {
+		t.Errorf("first parameter id = %q, want context", standardParams[0]["id"])
+	}
+	enumParam, _ := standardParams[0]["parameterType"].(map[string]any)["enumParameter"].(map[string]any)
+	contextVals, _ := enumParam["values"].([]map[string]any)
+	if len(contextVals) != 5 {
+		t.Errorf("standard context options count = %d, want 5", len(contextVals))
+	}
+
+	// 2. Custom model with 356000 matches 356k preset
+	customVariants, _ := entries[1]["variants"].([]map[string]any)
+	if len(customVariants) == 0 {
+		t.Fatal("customVariants is empty")
+	}
+	firstCustomParamVals := customVariants[0]["parameterValues"].([]map[string]any)
+	if firstCustomParamVals[0]["value"] != "356k" {
+		t.Errorf("default context variant for 356000 tokens = %v, want 356k", firstCustomParamVals[0]["value"])
+	}
+
+	// 3. Arbitrary model with 128000 gets a custom context option
+	arbitraryParams, _ := entries[2]["parameterDefinitions"].([]map[string]any)
+	arbEnumParam, _ := arbitraryParams[0]["parameterType"].(map[string]any)["enumParameter"].(map[string]any)
+	arbVals, _ := arbEnumParam["values"].([]map[string]any)
+	if len(arbVals) != 6 {
+		t.Errorf("arbitrary model context options count = %d, want 6 (5 presets + 1 custom)", len(arbVals))
+	}
+	if arbVals[0]["value"] != "128k" {
+		t.Errorf("arbitrary custom option value = %v, want 128k", arbVals[0]["value"])
+	}
+	if arbVals[0]["displayName"] != "128K (Custom)" {
+		t.Errorf("arbitrary custom option displayName = %v, want 128K (Custom)", arbVals[0]["displayName"])
+	}
+}

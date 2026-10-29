@@ -772,14 +772,22 @@ func (l *goproxyLogAdapter) Printf(format string, args ...interface{}) {
 		// logger.Infof("goproxy ignore handshake mismatch: %s", msg)
 		return
 	}
-	if strings.Contains(lower, "broken pipe") || strings.Contains(lower, "connection reset by peer") {
-		// logger.Infof("goproxy transient network error: %s", msg)
+	if isExpectedClientDisconnectLog(lower) {
 		return
 	}
 	if suppressed, ok := proxyLogLimiter.ShouldLog("goproxy|" + goproxyMessageRateLimitKey(msg)); ok {
 		logSuppressedProxyMessages("goproxy", suppressed)
 		logger.Infof("goproxy: %s", msg)
 	}
+}
+
+func isExpectedClientDisconnectLog(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "forcibly closed by the remote host") ||
+		strings.Contains(message, "connection aborted by the software in your host machine") ||
+		strings.Contains(message, "aborted by the software in your host machine")
 }
 
 func errorRateLimitKey(err error) string {

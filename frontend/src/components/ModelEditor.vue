@@ -91,7 +91,55 @@ function createOptionalPositiveIntegerModel(key) {
 
 const maxCompletionTokensInput = createOptionalPositiveIntegerModel("maxCompletionTokens");
 const anthropicMaxTokensInput = createOptionalPositiveIntegerModel("anthropicMaxTokens");
-const contextWindowTokensInput = createOptionalPositiveIntegerModel("contextWindowTokens");
+
+function parseTokenText(text) {
+  const trimmed = String(text || "").trim().toLowerCase();
+  if (!trimmed) return 0;
+  if (/^\d+$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
+  if (match) {
+    const num = Number(match[1]);
+    const unit = match[2];
+    if (unit === "k") return Math.round(num * 1000);
+    if (unit === "m") return Math.round(num * 1000000);
+    return Math.round(num);
+  }
+  return 0;
+}
+
+const contextPresetOptions = [
+  { label: "200K", value: 200000 },
+  { label: "356K", value: 356000 },
+  { label: "500K", value: 500000 },
+  { label: "800K", value: 800000 },
+  { label: "1M", value: 1000000 },
+];
+
+function formatTokenLabel(tokens) {
+  if (!tokens || tokens <= 0) return "";
+  if (tokens >= 1000000 && tokens % 1000000 === 0) {
+    return `${tokens / 1000000}M`;
+  }
+  if (tokens >= 1000 && tokens % 1000 === 0) {
+    return `${tokens / 1000}K`;
+  }
+  return Number(tokens).toLocaleString();
+}
+
+const contextWindowTokensInput = computed({
+  get() {
+    return draft.contextWindowTokens > 0 ? String(draft.contextWindowTokens) : "";
+  },
+  set(value) {
+    draft.contextWindowTokens = parseTokenText(value);
+  },
+});
+
+function selectContextPreset(tokens) {
+  draft.contextWindowTokens = draft.contextWindowTokens === tokens ? 0 : tokens;
+}
 const interfacePlaceholder = computed(() =>
   draft.type === "anthropic" ? "例如：https://api.anthropic.com" : "例如：https://api.openai.com/v1",
 );
@@ -441,19 +489,49 @@ onBeforeUnmount(() => {
             </Combobox>
           </div>
 
-          <label class="flex flex-col gap-1">
-            <span class="center-row justify-start gap-1.5 text-sm text-[#d4d4d4]">
-              <Tooltip :content="fieldTips.contextWindowTokens" />
-              <span>上下文窗口</span>
-            </span>
-            <input
-              v-model="contextWindowTokensInput"
-              type="text"
-              inputmode="numeric"
-              placeholder="例如：200000（留空用默认值）"
-              class="h-9 rounded-[6px] border border-[#3f3f3f] bg-[#232323] px-3 text-sm text-[#e5e5e5] outline-none focus:border-[#10AD5D]"
-            />
-          </label>
+          <div class="flex flex-col gap-1.5">
+            <div class="flex items-center justify-between">
+              <span class="center-row justify-start gap-1.5 text-sm text-[#d4d4d4]">
+                <Tooltip :content="fieldTips.contextWindowTokens" />
+                <span>上下文窗口</span>
+              </span>
+              <span v-if="draft.contextWindowTokens > 0" class="text-xs font-mono text-[#10AD5D]">
+                {{ formatTokenLabel(draft.contextWindowTokens) }} Tokens
+              </span>
+            </div>
+            <div class="flex items-center gap-2">
+              <input
+                v-model="contextWindowTokensInput"
+                type="text"
+                placeholder="例如：200K, 356K, 1M 或 200000"
+                class="h-9 flex-1 rounded-[6px] border border-[#3f3f3f] bg-[#232323] px-3 text-sm text-[#e5e5e5] outline-none focus:border-[#10AD5D]"
+              />
+              <button
+                v-if="draft.contextWindowTokens > 0"
+                type="button"
+                class="h-9 rounded-[6px] border border-[#3f3f3f] bg-[#2a2a2a] px-2.5 text-xs text-[#999] hover:bg-[#333] hover:text-[#e5e5e5]"
+                @click="draft.contextWindowTokens = 0"
+              >
+                重置
+              </button>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 pt-0.5">
+              <button
+                v-for="preset in contextPresetOptions"
+                :key="preset.value"
+                type="button"
+                :class="[
+                  'h-6 rounded-[4px] px-2 text-xs font-medium transition-colors',
+                  draft.contextWindowTokens === preset.value
+                    ? 'bg-[#10AD5D] text-white'
+                    : 'bg-[#2a2a2a] text-[#b3b3b3] hover:bg-[#383838] hover:text-white'
+                ]"
+                @click="selectContextPreset(preset.value)"
+              >
+                {{ preset.label }}
+              </button>
+            </div>
+          </div>
 
           <label v-if="draft.type === 'openai'" class="flex flex-col gap-1">
             <span class="center-row justify-start gap-1.5 text-sm text-[#d4d4d4]">

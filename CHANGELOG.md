@@ -1,0 +1,234 @@
+# Local Changes
+
+> Record local changes by date, newest first. Each change uses a `## YYYY-MM-DD` heading and a separate `###` entry.
+
+## 2026-08-19
+
+### Fixed: Checkpoint blob lockup on failed turns and prompt deduplication
+
+### Changes
+
+- **Immediate failed terminal events**: `failActiveStream` now discards pending checkpoint blob synchronization and triggers the failed terminal event (`broker.Fail` / `StreamEvent.End`) immediately upon upstream errors, preventing Cursor UI from hanging indefinitely.
+- **Prepend user messages & deduplication**: Supported extracting `PrependUserMessages` from user actions and deduplicating completed message IDs against conversation history to avoid replaying prior turns on unqueue.
+
+### Regression coverage
+
+- Updated `TestCheckpointBlobSyncPublishesFailedTerminalImmediately` and `TestCheckpointBlobTimeoutStillPublishesFailedTerminal` in `internal/backend/forwarder`.
+- Added tests for prepend user messages and queue deduplication.
+
+### Verification
+
+```powershell
+go test ./internal/backend/forwarder/...
+go test ./...
+```
+
+## 2026-08-18
+
+### Changed: Performance optimization, shell recovery, and tool caching
+
+### Changes
+
+- **Prompt and tool caching**: Introduced caching for baseline tools, sanitized prompts, and tool catalogs across modes to eliminate redundant disk reads.
+- **Shell dispatch recovery**: Added a recovery timer and mechanism when client fails to acknowledge shell execution within the dispatch deadline.
+- **Python / Node.js unbuffered streaming**: Enriched PowerShell shell commands with environment flags (`PYTHONUNBUFFERED=1`, `NODE_NO_WARNINGS=1`) to eliminate stdout buffering during command streaming.
+- **Compact context serialization**: Serialized conversation context snapshots with compact JSON (omitting extra whitespace) to save memory, disk I/O, and CPU time.
+- **Active conversation protection**: Added logic and tests to ignore empty resume run requests while a turn is actively running.
+- **Enhanced checkpoint blob management**: Refactored timer tokens and pending blob metadata tracking with lifecycle metrics.
+- **MITM disconnect logging**: Streamlined client disconnect log filters.
+
+## 2026-08-17
+
+### Changed: Forwarder lifecycle cleanup and task guidelines
+
+### Changes
+
+- **Forwarder host module management**: Added formal forwarder service lifecycle management and graceful flush/closure in `UsageFileStore` upon host shutdown.
+- **Prompt and task management guidelines**: Enhanced common prefix prompt documentation with clear rules for proactive concurrent subagent execution, task delegation, and structured lossless conversation compaction.
+
+## 2026-08-15
+
+### Changed: Commit prompt and compaction refinement
+
+### Changes
+
+- Clarified instructions and formatting rules for commit message generation.
+- Expanded conversation compaction guidelines for structured retention.
+
+## 2026-08-14
+
+### Changed: Latency instrumentation and plan tracking
+
+### Changes
+
+- **Provider pass latency metrics**: Instrumented compile, TTFT, cache hit, and total duration metrics for provider-pass diagnostics while maintaining lossless replay.
+- **Untracked local plans**: Configured `.gitignore` to keep local planning artifacts out of git tracking.
+
+## 2026-08-13
+
+### Fixed: Retain MCP registry when request context is absent
+
+### Changes
+
+- Ensured MCP tool registry snapshot is retained and persisted even when inbound request context is omitted.
+
+## 2026-08-12
+
+### Changed: Upstream v0.0.48 sync, per-user CA, and content-addressed images
+
+### Changes
+
+- **Sync upstream v0.0.48**: Merged upstream release updates and build configurations.
+- **Per-installation Root CA**: Generated unique, per-installation root CA certificates rather than using a shared static certificate.
+- **Content-addressed Read images**: Supported image reading via local tools with content hash persistence.
+- **Deterministic MCP snapshotting**: Snapshotted MCP registry per request, filtering out disabled servers and normalizing server aliases.
+- **Language policy cleanup**: Reverted downstream language policy injection in favor of shared rules.
+
+## 2026-08-11
+
+### Changed: Optional reasoning effort and plan execution directive
+
+### Changes
+
+- **Optional reasoning effort**: Supported models/providers that do not accept reasoning effort parameters.
+- **Execute plan directive**: Introduced directive to execute current plans directly within conversation actions.
+- **AwaitShell polling refinement**: Finalized polling until shell completion.
+
+## 2026-08-10
+
+### Changed: Sync upstream and expand the conversation forwarder
+
+### Changes
+
+Merged `upstream/main` and integrated changes for checkpoint/projection, append-only compaction, imported history, the state database, provider adapters, upstream mocks, and UI/localization/build configuration.
+
+The forwarder now provides improved conversation recovery, transcript replay, and terminal state management. It also adds handling for shell streaming, cancellation, terminal events, interrupted output, and continuation/checkpoint cases while the Agent is running.
+
+The MCP tool registry is normalized by server identifier and tool name, and can resolve aliases from server names for compatibility with descriptors provided by Cursor.
+
+### Fixed: AwaitShell waited duration and timeout handling
+
+`AwaitShell` now polls the shell state every 50ms until the shell completes, the requested pattern matches, or `block_until_ms` expires. Previously it returned a single snapshot immediately while reporting the requested wait duration, which could make a 1–3 second shell appear to have waited for repeated 30-second or 2-minute intervals.
+
+The default wait timeout remains 30 seconds per `AwaitShell` call. A completed shell returns immediately, while `block_until_ms: 0` performs an immediate snapshot. Foreground shell recovery keeps the existing 1.5-second grace period after the configured wait deadline.
+
+### Regression coverage
+
+- Added tests for checkpoint blobs, append-only compaction, imported history, and the state database.
+- Added tests for shell stream deltas, interrupted output, terminal lifecycle, and provider thinking/reasoning carriers.
+- Updated tests for the MCP registry, model streaming, and upstream mocks.
+
+### Verification
+
+The following commands completed successfully:
+
+```powershell
+go build ./...
+go test ./...
+yarn build
+go test ./internal/backend/forwarder
+```
+
+`git diff --cached --check` also passed. `go vet ./...` continues to report a baseline error/warning at `internal/backend/agent/bridge/interaction/bridge.go:328` because `json.Marshal` copies a lock value in `SwitchModeArgs`; no new errors from the merge were found. E2E testing with the Cursor client and a real provider has not been run.
+
+## 2026-08-05
+
+### Changed: Sync upstream v0.0.45 and use inline checkpoints
+
+### Changes
+
+Merged `upstream/main` v0.0.45. The conversation checkpoint mechanism was changed from blob-backed turns to inline turns from upstream to apply the fix for disappearing conversations.
+
+Blob synchronization, imported blobs, and the checkpoint blob timeout were removed under the new contract. Conversation state import and replay now decode inline turns/steps directly from the checkpoint.
+
+### Preserved fork behavior
+
+- Shared reasoning from a provider pass is persisted in only one tool call; `tool_result` retains reasoning as a fallback only when the corresponding `tool_call` is missing.
+- Late partial/delta updates are ignored after a tool has completed.
+- Hidden `PatchEdit` and `Write` operations continue to recover when the transport closes before the terminal result, while also completing the operation when the turn is canceled.
+- The terminal stream does not emit duplicate terminal events or allow subscriptions after it has ended.
+
+### Upstream updates
+
+- Bumped the release version to `0.0.45`.
+- Added the `CURSOR_BYOK_DISABLE_WEBVIEW_SANDBOX` environment variable to disable the WebView sandbox for affected VDI environments.
+
+### Verification
+
+```powershell
+go test ./... -count=1 -timeout 180s
+```
+
+The command completed successfully. `go vet ./...` continues to report two existing warnings at `internal/backend/agent/bridge/interaction/bridge.go`; they are unrelated to this merge.
+
+## 2026-08-03
+
+### Fixed: Reasoning/progress repeated before multiple tools in one Agent turn
+
+### Symptom
+
+After syncing upstream, a reasoning/progress block could appear repeatedly before each tool in the same Agent turn. This was especially visible when the provider returned multiple consecutive tool calls.
+
+### Cause
+
+Provider reasoning was accumulated at the provider-pass level but was previously copied into every `ToolLikeCompleted`. As a result, the same reasoning data was persisted multiple times in `tool_call` and was also written to `tool_result` when the tool completed.
+
+The new Cursor transcript sync feature from upstream renders persisted `tool_call` entries directly, making this latent issue visible as repeated progress/tool rows in the UI.
+
+### Fix
+
+The reasoning buffer now has explicit ownership: it is consumed exactly once by the first tool in the provider pass. If the provider also emits text, the reasoning is attached to `assistant_text` and is not copied to the tool.
+
+`tool_result` retains `reasoning_content` only when the corresponding `tool_call` is missing, preserving replay support for older or incomplete history.
+
+### Verification
+
+Added regression tests covering shared reasoning across multiple tools, single-render transcript reasoning, and `tool_result` fallback only when the corresponding `tool_call` is missing:
+
+```text
+TestTakeProviderOutputForToolConsumesReasoningOnce
+TestToolResultReasoningFallbackOnlyPersistsWhenToolCallIsMissing
+TestProjectorKeepsSharedReasoningOnOnlyOneOfMultipleToolCalls
+TestProjectCursorTranscriptJSONLKeepsSharedReasoningOnOnlyOneTool
+```
+
+Test command:
+
+```powershell
+go test ./internal/backend/forwarder -count=1 -timeout 60s
+```
+
+### Fixed: Cursor Agent transcript repeated or lost content while responding
+
+### Symptom
+
+While the Agent was streaming a response or calling a tool, the Cursor UI could display repeated progress/file rows. Some content that had already appeared could also disappear or be replaced by an older snapshot.
+
+### Cause
+
+Local conversation history synchronization to the Cursor transcript wrote the entire transcript after every history change. This happened concurrently with the Cursor client appending stream events for the same turn, causing two flows to update the transcript:
+
+- The Cursor client rendered stream events directly.
+- The backend re-projected history and overwrote the transcript file.
+
+An intermediate history snapshot might not contain all of the latest events, causing content to repeat or disappear from the UI.
+
+### Fix
+
+Transcript sync is now deferred while the Agent turn is active (`running`, `waiting_tool`, or `checkpointing`). The backend writes the transcript only after the turn reaches a terminal state such as `turn_completed`, `failed`, `provider_error`, or `canceled`.
+
+The terminal snapshot also includes `turn_ended`, so the completed transcript matches the final state of the chat turn.
+
+### Verification
+
+Added a regression test confirming that the transcript is not created during an active turn and is written only after `turn_completed`:
+
+```text
+TestConversationFileStoreDefersCursorTranscriptSyncUntilTurnEnds
+```
+
+Test command:
+
+```powershell
+go test ./internal/backend/forwarder -run "TestConversationFileStore(DefersCursorTranscriptSyncUntilTurnEnds|SyncsCursorTranscript|BackfillsTranscriptOnStartup)" -count=1 -timeout 30s
+```

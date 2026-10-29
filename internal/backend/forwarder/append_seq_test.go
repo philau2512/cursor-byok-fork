@@ -165,3 +165,23 @@ func TestAppendSequenceTrackerRestartWaitsUntilIdle(t *testing.T) {
 	}
 	ticket2.Release()
 }
+
+func TestAppendSequenceTrackerDoesNotForceRestartWhileProcessing(t *testing.T) {
+	tracker := newAppendSequenceTracker()
+	ticket, stale, err := tracker.Acquire(context.Background(), "req-busy-restart", 1)
+	if err != nil || stale {
+		t.Fatalf("initial acquire: stale=%v err=%v", stale, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, stale, err = tracker.Acquire(ctx, "req-busy-restart", 1)
+	if stale {
+		t.Fatal("restart became stale while the current sequence was processing")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("restart error = %v, want context deadline exceeded", err)
+	}
+
+	ticket.Release()
+}

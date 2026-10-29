@@ -276,7 +276,48 @@ func cleanGeneratedCommitMessage(value string) string {
 		}
 		result = strings.TrimSpace(result[len(matched):])
 	}
+	result = normalizeCommitMessageFormatting(result)
 	return strings.TrimSpace(result)
+}
+
+func normalizeCommitMessageFormatting(value string) string {
+	rawLines := strings.Split(value, "\n")
+	var cleanedLines []string
+	for _, l := range rawLines {
+		cleanedLines = append(cleanedLines, strings.TrimRight(l, "\r"))
+	}
+
+	var subjectParts []string
+	bodyStartIndex := len(cleanedLines)
+
+	for i, line := range cleanedLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			bodyStartIndex = i + 1
+			break
+		}
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			bodyStartIndex = i
+			break
+		}
+		subjectParts = append(subjectParts, trimmed)
+	}
+
+	subject := strings.Join(subjectParts, " ")
+	if subject == "" {
+		return strings.TrimSpace(value)
+	}
+
+	var bodyLines []string
+	for i := bodyStartIndex; i < len(cleanedLines); i++ {
+		bodyLines = append(bodyLines, cleanedLines[i])
+	}
+	body := strings.TrimSpace(strings.Join(bodyLines, "\n"))
+
+	if body == "" {
+		return subject
+	}
+	return subject + "\n\n" + body
 }
 
 func stripCommitMessageCodeFence(value string) string {

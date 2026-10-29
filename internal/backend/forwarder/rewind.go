@@ -88,6 +88,64 @@ func (service *Service) decideRunRewind(intent InboundIntent, conversation *Conv
 	return decision
 }
 
+// filterUnprocessedUserMessages 检查 user message 与 prepend_user_messages 是否已在 conversation 历史中存在。
+// 如果 intent 中的 message 已经有对应 turn 存在，则从待执行列表中过滤，防止 unqueue 时重复执行旧 prompt。
+func filterUnprocessedUserMessages(intent InboundIntent, conversation *ConversationFile) (targetUserMsg *agentv1.UserMessage, remainingPrepends []*agentv1.UserMessage, hasNewWork bool) {
+	if conversation == nil || len(conversation.Entries) == 0 {
+		return intent.UserMessage, intent.PrependUserMessages, intent.UserMessage != nil || len(intent.PrependUserMessages) > 0
+	}
+	existingMessageIDs := make(map[string]struct{})
+	for _, entry := range conversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "user_message" || len(entry.Payload) == 0 {
+			continue
+		}
+		userMessage := &agentv1.UserMessage{}
+		if err := protojson.Unmarshal(entry.Payload, userMessage); err != nil {
+			continue
+		}
+		msgID := strings.TrimSpace(userMessage.GetMessageId())
+		if msgID != "" {
+			existingMessageIDs[msgID] = struct{}{}
+		}
+	}
+
+	newPrepends := make([]*agentv1.UserMessage, 0, len(intent.PrependUserMessages))
+	for _, p := range intent.PrependUserMessages {
+		if p == nil {
+			continue
+		}
+		pID := strings.TrimSpace(p.GetMessageId())
+		if pID != "" {
+			if _, exists := existingMessageIDs[pID]; exists {
+				continue
+			}
+		}
+		newPrepends = append(newPrepends, p)
+	}
+
+	activeUser := intent.UserMessage
+	if activeUser != nil {
+		activeID := strings.TrimSpace(activeUser.GetMessageId())
+		if activeID != "" {
+			if _, exists := existingMessageIDs[activeID]; exists {
+				// 主 UserMessage 已经存在于历史中，检查是否有新的 prepends 可以作为 active target
+				if len(newPrepends) > 0 {
+					activeUser = newPrepends[len(newPrepends)-1]
+					newPrepends = newPrepends[:len(newPrepends)-1]
+				} else {
+					activeUser = nil
+				}
+			}
+		}
+	} else if len(newPrepends) > 0 {
+		activeUser = newPrepends[len(newPrepends)-1]
+		newPrepends = newPrepends[:len(newPrepends)-1]
+	}
+
+	hasWork := activeUser != nil || len(newPrepends) > 0
+	return activeUser, newPrepends, hasWork
+}
+
 func shouldEvaluateRunRewind(intent InboundIntent) bool {
 	if strings.TrimSpace(intent.Kind) != "run" || intent.Prewarm || intent.UserMessage == nil {
 		return false

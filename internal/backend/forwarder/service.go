@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -36,6 +39,8 @@ const (
 	defaultSummaryCompletedThought = "Chat context summarized"
 	providerDefaultMaxOutputTokens = 65536
 	providerOutputSafetyTokens     = 1024
+
+	executePlanDirective = "Execute the current plan now. Start implementing it immediately instead of discussing or revising the plan."
 
 	runtimeThinkingEffortParameterID = "thinking_effort"
 )
@@ -64,6 +69,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 		if _, exists := parsed.Overrides[subagentType]; exists {
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "duplicate_overrides_previous"})
 		}
+		var parsedSelection runtimecore.SubagentModelOverrideSelection
 		switch selection := item.GetSelection().(type) {
 		case *agentv1.SubagentModelOverride_Model:
 			model := selection.Model
@@ -72,7 +78,7 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "empty_model_id"})
 				continue
 			}
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType:                  subagentType,
 				Selection:                     "model",
 				ModelID:                       modelID,
@@ -82,17 +88,30 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				IsVariantStringRepresentation: model.GetIsVariantStringRepresentation(),
 			}
 		case *agentv1.SubagentModelOverride_Inherit:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "inherit",
 			}
 		case *agentv1.SubagentModelOverride_Disabled:
-			parsed.Overrides[subagentType] = runtimecore.SubagentModelOverrideSelection{
+			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType: subagentType,
 				Selection:    "disabled",
 			}
 		default:
 			parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "unknown_selection"})
+			continue
+		}
+		parsed.Overrides[subagentType] = parsedSelection
+		lower := strings.ToLower(subagentType)
+		if lower != subagentType {
+			if _, exists := parsed.Overrides[lower]; !exists {
+				parsed.Overrides[lower] = parsedSelection
+			}
+		}
+		if lower == "explorer" {
+			if _, exists := parsed.Overrides["explore"]; !exists {
+				parsed.Overrides["explore"] = parsedSelection
+			}
 		}
 	}
 	return parsed
@@ -130,7 +149,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 			effectiveModelID = ""
 		}
 	}
-	if effectiveModelID == "" && !disabled {
+	if (effectiveModelID == "" || effectiveModelID == "inherit" || effectiveModelID == "default" || effectiveModelID == "fast") && !disabled {
 		effectiveModelID = strings.TrimSpace(parentModelID)
 	}
 	payload := map[string]any{
@@ -248,6 +267,7 @@ func subagentModelOverrideSummaries(overrides map[string]runtimecore.SubagentMod
 
 type Service struct {
 	store              *ConversationFileStore
+	contentBlobs       *ContentBlobStore
 	usageStore         *UsageFileStore
 	codebaseIndexStore *CodebaseIndexStore
 	docsIndexStore     *DocsIndexStore
@@ -263,6 +283,7 @@ type Service struct {
 	execBridge         execbridge.ExecBridge
 	interactionBridge  interactionbridge.InteractionBridge
 	appendSeq          *appendSequenceTracker
+	runSerializers     sync.Map
 }
 
 type agentModelMemory interface {
@@ -274,6 +295,7 @@ type agentModelMemory interface {
 func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Service {
 	projector := NewHistoryProjector()
 	store := NewConversationFileStore(historyRoot)
+	contentBlobs := NewContentBlobStore(historyRoot)
 	broker := NewStreamBroker()
 	rules := NewUserRuleStore(appdata.RulesRootPath())
 	var modelMemory agentModelMemory
@@ -287,12 +309,13 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 	debug := newDebugRecorder(historyRoot, broker, debugConfig)
 	service := &Service{
 		store:              store,
+		contentBlobs:       contentBlobs,
 		usageStore:         NewUsageFileStore(historyRoot),
 		codebaseIndexStore: NewCodebaseIndexStore(appdata.CodebaseIndexRootPath()),
 		docsIndexStore:     NewDocsIndexStore(appdata.DocsIndexRootPath()),
 		rules:              rules,
 		projector:          projector,
-		compiler:           NewPromptCompiler(projector, NewToolCatalog(), NewReminderInjector(), rules),
+		compiler:           NewPromptCompiler(projector, NewToolCatalog(), NewReminderInjector(), rules, contentBlobs),
 		provider:           NewProviderGateway(resolver),
 		resolver:           resolver,
 		modelMemory:        modelMemory,
@@ -304,33 +327,21 @@ func NewService(historyRoot string, resolver modeladapter.ChannelResolver) *Serv
 		appendSeq:          newAppendSequenceTracker(),
 	}
 	service.startHistoryMaintenance()
-	store.SyncAllCursorTranscriptsBestEffort()
 	return service
 }
 
-// newServiceWithDependencies 主要用于测试场景，允许注入替身依赖。
-func newServiceWithDependencies(store *ConversationFileStore, projector *HistoryProjector, compiler PromptCompiler, provider ProviderGateway, broker *StreamBroker) *Service {
-	historyRoot := ""
-	if store != nil {
-		historyRoot = store.HistoryDir()
+// Close flushes telemetry that is intentionally persisted outside provider completion paths.
+func (service *Service) Close(ctx context.Context) error {
+	if service == nil {
+		return nil
 	}
-	debug := newDebugRecorder(historyRoot, broker, nil)
-	return &Service{
-		store:              store,
-		rules:              NewUserRuleStore(appdata.RulesRootPath()),
-		projector:          projector,
-		compiler:           compiler,
-		provider:           provider,
-		broker:             broker,
-		usageStore:         NewUsageFileStore(store.HistoryDir()),
-		codebaseIndexStore: NewCodebaseIndexStore(appdata.CodebaseIndexRootPath()),
-		docsIndexStore:     NewDocsIndexStore(appdata.DocsIndexRootPath()),
-		recorder:           newArtifactRecorder(store, broker, debug),
-		debug:              debug,
-		execBridge:         execbridge.NewBridge(),
-		interactionBridge:  interactionbridge.NewBridge(),
-		appendSeq:          newAppendSequenceTracker(),
+	if service.debug != nil {
+		service.debug.Close()
 	}
+	if service.usageStore == nil {
+		return nil
+	}
+	return service.usageStore.Close(ctx)
 }
 
 // BidiAppend 处理 legacy Bidi 上行，把用户输入和外部结果归一化后写入 history。
@@ -376,7 +387,14 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		"client_kind": strings.TrimSpace(clientKind),
 	})
 	service.debug.LogBidiDecoded(ctx, requestID, intent.ConversationID, appendSeqno, clientKind, message, intent, nil)
+	if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+		service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_received", queueMessageFields)
+	}
 	if err := service.dispatchInboundIntent(intent); err != nil {
+		if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+			queueMessageFields["error"] = err.Error()
+			service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_dispatch_failed", queueMessageFields)
+		}
 		if shouldAcknowledgeInterruptedInboundIntent(intent, err) {
 			service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "dispatch_interrupted_ignored", map[string]any{
 				"kind":  strings.TrimSpace(intent.Kind),
@@ -400,8 +418,35 @@ func (service *Service) BidiAppend(ctx context.Context, req *connect.Request[ais
 		"prewarm":         intent.Prewarm,
 		"ignored_reason":  strings.TrimSpace(intent.IgnoredReason),
 	})
+	if queueMessageFields, queued := queuedUserMessageDebugFields(clientKind, intent); queued {
+		service.debug.LogRuntime(ctx, requestID, intent.ConversationID, "queued_user_message_dispatched", queueMessageFields)
+	}
 
 	return connect.NewResponse(&aiserverv1.BidiAppendResponse{}), nil
+}
+
+func queuedUserMessageDebugFields(clientKind string, intent InboundIntent) (map[string]any, bool) {
+	if strings.TrimSpace(clientKind) != "conversation_action" || !intent.StartsRun || intent.ClientMessage == nil {
+		return nil, false
+	}
+	action := intent.ClientMessage.GetConversationAction()
+	if action == nil || conversationActionKind(action) != "user_message_action" {
+		return nil, false
+	}
+	text := userMessageText(intent.UserMessage)
+	fields := map[string]any{
+		"client_kind":               strings.TrimSpace(clientKind),
+		"conversation_action":       conversationActionKind(action),
+		"intent_kind":               strings.TrimSpace(intent.Kind),
+		"starts_run":                intent.StartsRun,
+		"has_explicit_mode":         intent.HasExplicitMode,
+		"mode":                      intent.Mode.String(),
+		"request_id":                strings.TrimSpace(intent.RequestID),
+		"conversation_id":           strings.TrimSpace(intent.ConversationID),
+		"user_message_bytes":        len(text),
+		"user_message_text_present": strings.TrimSpace(text) != "",
+	}
+	return fields, true
 }
 
 func shouldAcknowledgeInterruptedInboundIntent(intent InboundIntent, err error) bool {
@@ -463,21 +508,13 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 			for _, event := range backlog {
 				if event.Message != nil {
 					if err := stream.Send(event.Message); err != nil {
-						service.debug.LogRunSSE(ctx, requestID, "", "send_error", map[string]any{
-							"cursor":       cursor,
-							"message_case": agentServerMessageCase(event.Message),
-							"message":      protoJSONDebugPayload(event.Message),
-							"error":        err.Error(),
-						})
+						service.logRunSSEMessage(ctx, requestID, "send_error", cursor, event.Message, err)
 						return err
 					}
-					service.debug.LogRunSSE(ctx, requestID, "", "send_message", map[string]any{
-						"cursor":       cursor,
-						"message_case": agentServerMessageCase(event.Message),
-						"message":      protoJSONDebugPayload(event.Message),
-					})
+					service.logRunSSEMessage(ctx, requestID, "send_message", cursor, event.Message, nil)
 				}
 				cursor++
+				_ = service.broker.AcknowledgeCursor(requestID, subscriberID, cursor)
 				if event.End {
 					service.debug.LogRunSSE(ctx, requestID, "", "terminal", map[string]any{
 						"cursor":                 cursor,
@@ -540,6 +577,21 @@ func (service *Service) RunSSE(ctx context.Context, req *connect.Request[aiserve
 	}
 }
 
+func (service *Service) logRunSSEMessage(ctx context.Context, requestID string, eventName string, cursor int, message *agentv1.AgentServerMessage, streamErr error) {
+	if service == nil || service.debug == nil || !service.debug.enabled(ctx) {
+		return
+	}
+	fields := map[string]any{
+		"cursor":       cursor,
+		"message_case": agentServerMessageCase(message),
+		"message":      protoJSONDebugPayload(message),
+	}
+	if streamErr != nil {
+		fields["error"] = streamErr.Error()
+	}
+	service.debug.LogRunSSE(ctx, requestID, "", eventName, fields)
+}
+
 // decodeInboundIntent 把 legacy AgentClientMessage 映射为 forwarder 内部 intent。
 func (service *Service) decodeInboundIntent(requestID string, message *agentv1.AgentClientMessage, clientKind string) (InboundIntent, error) {
 	intent := InboundIntent{
@@ -561,6 +613,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.ConversationState = runRequest.GetConversationState()
 		intent.PreFetchedBlobs = runRequest.GetPreFetchedBlobs()
 		intent.UserMessage = extractUserMessage(message)
+		intent.PrependUserMessages = extractPrependUserMessages(message)
 		intent.RequestContext = extractRequestContext(message)
 		if service.shouldIgnoreEmptyResumeRunRequest(requestID, runRequest, intent.UserMessage, intent.RequestContext) {
 			intent.Kind = "metadata"
@@ -578,6 +631,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = extractRequestedModelID(message)
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.SubagentTypeName = strings.TrimSpace(runRequest.GetSubagentTypeName())
 		parsedOverrides := parseSubagentModelOverrides(runRequest.GetSubagentModelOverrides())
 		intent.SubagentModelOverrides = parsedOverrides.Overrides
@@ -588,6 +642,13 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			"overrides":      subagentModelOverrideSummaries(parsedOverrides.Overrides),
 			"ignored":        parsedOverrides.Ignored,
 		})
+		if (intent.ModelID == "" || intent.ModelID == "default") && intent.SubagentTypeName != "" {
+			if override, _, ok := runtimecore.LookupSubagentModelOverride(intent.SubagentModelOverrides, intent.SubagentTypeName); ok {
+				if strings.TrimSpace(override.Selection) == "model" && strings.TrimSpace(override.ModelID) != "" {
+					intent.ModelID = strings.TrimSpace(override.ModelID)
+				}
+			}
+		}
 		if intent.ModelID == "" {
 			intent.ModelID = "default"
 		}
@@ -614,6 +675,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		}
 		intent.ModelID = firstNonEmpty(extractRequestedModelID(message), "default")
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
+		intent.RequestedContextTokens = extractRequestedContextTokens(message)
 		intent.ModelName = service.resolveRequestedModelName(message, intent.ModelID)
 	case "conversation_action":
 		action := message.GetConversationAction()
@@ -621,6 +683,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			return InboundIntent{}, fmt.Errorf("conversation_action payload is required")
 		}
 		intent.UserMessage = extractConversationActionUserMessage(action)
+		intent.PrependUserMessages = extractConversationActionPrependUserMessages(action)
 		intent.RequestContext = extractConversationActionRequestContext(action)
 		intent.StartsRun = conversationActionStartsRun(action)
 		intent.Mode, intent.ModeSource, intent.HasExplicitMode, err = extractConversationActionMode(action)
@@ -633,7 +696,11 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			intent.CancelReason = strings.TrimSpace(item.CancelAction.GetReason())
 		default:
 			if intent.StartsRun || intent.HasExplicitMode {
-				if stream, ok := service.broker.Get(intent.RequestID); ok && stream != nil {
+				stream, routed := service.broker.Get(intent.RequestID)
+				if !routed || stream == nil {
+					stream, routed = service.broker.SingleActiveStream()
+				}
+				if stream != nil {
 					stream.mu.Lock()
 					intent.ConversationID = strings.TrimSpace(stream.ConversationID)
 					intent.ModelID = strings.TrimSpace(stream.ModelID)
@@ -648,7 +715,7 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 					stream.mu.Unlock()
 				}
 				if strings.TrimSpace(intent.ConversationID) == "" {
-					return InboundIntent{}, fmt.Errorf("conversation_action requires active request context")
+					return InboundIntent{}, fmt.Errorf("conversation_action requires exactly one active conversation context")
 				}
 			}
 			if intent.StartsRun {
@@ -682,6 +749,60 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 	return intent, nil
 }
 
+func (service *Service) supersedeActiveRunWithSameRequest(intent InboundIntent, nextTurnSeq int64) {
+	if service == nil || service.broker == nil || strings.TrimSpace(intent.RequestID) == "" {
+		return
+	}
+	stream, ok := service.broker.Get(intent.RequestID)
+	if !ok || stream == nil {
+		return
+	}
+	stream.mu.Lock()
+	active := stream.ProviderActive || len(stream.PendingExecs) > 0 || len(stream.PendingInteractions) > 0 || stream.Phase == TurnPhaseWaitingExternal
+	if !active {
+		stream.mu.Unlock()
+		return
+	}
+	previousToken := stream.CurrentProviderToken
+	previousTurnSeq := stream.TurnSeq
+	if stream.ProviderCancel != nil {
+		stream.ProviderCancel()
+		stream.ProviderCancel = nil
+	}
+	stream.ProviderActive = false
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
+	stream.PendingProviderAction = providerActionNone
+	stream.PendingProviderCompletion = nil
+	stream.PendingCompaction = nil
+	stream.PendingExecs = make(map[string]runtimecore.PendingExec)
+	stream.PendingInteractions = make(map[string]runtimecore.PendingInteraction)
+	stream.TimerTokens = make(map[string]uint64)
+	stream.UpdatedAt = time.Now().UTC()
+	nextToken := stream.CurrentProviderToken
+	stream.mu.Unlock()
+	service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "run_superseded_same_request", map[string]any{
+		"request_id":              strings.TrimSpace(intent.RequestID),
+		"conversation_id":         strings.TrimSpace(intent.ConversationID),
+		"previous_turn_seq":       previousTurnSeq,
+		"next_turn_seq":           nextTurnSeq,
+		"previous_provider_token": previousToken,
+		"next_provider_token":     nextToken,
+	})
+}
+
+func (service *Service) executeSerializedRun(intent InboundIntent) error {
+	if service == nil || strings.TrimSpace(intent.ConversationID) == "" {
+		return service.handleRunIntent(intent)
+	}
+	candidate := &sync.Mutex{}
+	actual, _ := service.runSerializers.LoadOrStore(strings.TrimSpace(intent.ConversationID), candidate)
+	lock := actual.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	return service.handleRunIntent(intent)
+}
+
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
@@ -696,6 +817,7 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	if err != nil {
 		return err
 	}
+	service.supersedeActiveRunWithSameRequest(intent, turnSeq)
 	if intent.RequestContext != nil {
 		if folder := normalizeAgentTranscriptsFolder(intent.RequestContext.GetEnv().GetAgentTranscriptsFolder()); folder != "" {
 			conversation.AgentTranscriptsFolder = folder
@@ -711,6 +833,23 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		initialEntries, err = buildRunEntries(intent, effectiveMode, turnSeq)
 		if err != nil {
 			return err
+		}
+	} else if !intent.Prewarm && !intent.ManualCompaction.Requested {
+		// 检查是否所有 user messages 都已经在历史中执行完毕，防止 unqueue 时重复执行旧 prompt
+		targetUser, remainingPrepends, hasNewWork := filterUnprocessedUserMessages(intent, conversation)
+		if !hasNewWork {
+			service.debug.LogRuntime(context.Background(), intent.RequestID, intent.ConversationID, "unprocessed_user_messages_empty", map[string]any{
+				"reason": "all_user_messages_already_present_in_history",
+			})
+			return nil
+		}
+		if targetUser != intent.UserMessage || len(remainingPrepends) != len(intent.PrependUserMessages) {
+			intent.UserMessage = targetUser
+			intent.PrependUserMessages = remainingPrepends
+			initialEntries, err = buildRunEntries(intent, effectiveMode, turnSeq)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	if service.store != nil {
@@ -758,8 +897,17 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 		return err
 	}
 	updateStreamRequestContextData(stream, intent.RequestContext)
+	hydrateStreamMCPToolServers(stream, conversation.MCPToolServers)
 	service.updateStreamMCPToolServers(stream, intent.RequestContext)
-	clearPendingProviderCompletion(stream)
+	streamMCPToolServers := snapshotStreamMCPToolServers(stream)
+	if _, err := service.store.UpdateConversationMeta(intent.ConversationID, func(conversation *ConversationFile) error {
+		if conversation != nil {
+			conversation.MCPToolServers = streamMCPToolServers
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	stream.mu.Lock()
 	stream.ThinkingEffort = strings.TrimSpace(intent.ThinkingEffort)
 	stream.SubagentModelOverrides = cloneSubagentModelOverrides(intent.SubagentModelOverrides)
@@ -773,8 +921,8 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	stream.BackgroundShellsByMessageID = make(map[uint32]string)
 	stream.BackgroundShellsByExecID = make(map[string]string)
 	stream.TimerTokens = make(map[string]uint64)
-	stream.CurrentProviderToken = 0
-	stream.CurrentCompactionToken = 0
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
 	stream.ProviderAccumulatedText = ""
 	stream.ProviderAccumulatedReasoning = ""
 	stream.ProviderAccumulatedReasoningSignature = ""
@@ -812,24 +960,6 @@ func (service *Service) handleRunIntent(intent InboundIntent) error {
 	return service.requestProviderAction(stream, providerActionStart)
 }
 
-func (service *Service) loadPreviousSummaryReplay(conversationID string) ([][]byte, bool, error) {
-	if service == nil || strings.TrimSpace(conversationID) == "" {
-		return nil, false, nil
-	}
-	return service.loadLatestCarryForwardReplay(conversationID)
-}
-
-func (service *Service) snapshotVisibleTurns(conversation *ConversationFile) ([][]byte, error) {
-	if service == nil || service.projector == nil || conversation == nil {
-		return nil, nil
-	}
-	state, err := service.projector.ProjectLegacyCheckpoint(conversation)
-	if err != nil {
-		return nil, err
-	}
-	return cloneByteSlices(state.GetTurns()), nil
-}
-
 // handleCancelIntent 处理取消请求，并向客户端发送执行桥 abort。
 func (service *Service) handleCancelIntent(intent InboundIntent) error {
 	stream, ok := service.broker.Get(intent.RequestID)
@@ -863,7 +993,23 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 	for _, pending := range stream.PendingExecs {
 		pendingExecs = append(pendingExecs, pending)
 	}
+	if stream.ProviderCancel != nil {
+		stream.ProviderCancel()
+		stream.ProviderCancel = nil
+	}
+	stream.ProviderActive = false
+	stream.CurrentProviderToken++
+	stream.CurrentCompactionToken++
+	stream.PendingProviderAction = providerActionNone
+	stream.PendingCompaction = nil
+	stream.PatchEditQueues = make(map[string][]queuedPatchEditOperation)
+	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
+	for _, pending := range pendingExecs {
+		if err := service.completePendingEditAfterCancel(stream, pending); err != nil {
+			return err
+		}
+	}
 	for _, pending := range pendingExecs {
 		_ = service.broker.Publish(intent.RequestID, StreamEvent{
 			Message: buildExecAbortMessage(pending),
@@ -879,6 +1025,32 @@ func (service *Service) handleCancelIntent(intent InboundIntent) error {
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseCanceled)
 	return service.broker.Cancel(intent.RequestID, firstNonEmpty(intent.CancelReason, "[canceled] User aborted request"))
+}
+
+func (service *Service) completePendingEditAfterCancel(stream *ActiveStream, pending runtimecore.PendingExec) error {
+	if stream == nil || (!isHiddenWriteExecKind(pending.ExecKind) && !isHiddenPatchEditExecKind(pending.ExecKind)) {
+		return nil
+	}
+	if isHiddenPatchEditExecKind(pending.ExecKind) {
+		payload, err := decodePendingPatchEditPayload(pending.ArgsJSON)
+		if err != nil {
+			return err
+		}
+		markExecCompleted(stream, pending)
+		if pending.ExecKind == patchEditPostReadExecKindName {
+			return service.finishPatchEditOperation(stream, pending.ToolCallID, pending.ModelCallID, pending.ProviderPass, pending.ReasoningContent, payload, buildFinalEditSuccessResult(payload.ResolvedPath, payload.AfterContent, patchEditPayloadAsEditPayload(payload)))
+		}
+		return service.finishPatchEditOperation(stream, pending.ToolCallID, pending.ModelCallID, pending.ProviderPass, pending.ReasoningContent, payload, buildEditErrorResult(payload.ResolvedPath, "PatchEdit canceled before terminal result arrived"))
+	}
+	payload, err := decodePendingWritePayload(pending.ArgsJSON)
+	if err != nil {
+		return err
+	}
+	markExecCompleted(stream, pending)
+	if pending.ExecKind == writePostReadExecKind {
+		return service.finishWriteOperation(stream, pending.ToolCallID, pending.ModelCallID, pending.ProviderPass, pending.ReasoningContent, payload.VisibleArgs, buildSuccessfulWriteResult(payload.ResolvedPath, payload.BeforeContent, payload.AfterContent))
+	}
+	return service.finishWriteOperation(stream, pending.ToolCallID, pending.ModelCallID, pending.ProviderPass, pending.ReasoningContent, payload.VisibleArgs, buildEditErrorResult(payload.ResolvedPath, "Write canceled before terminal result arrived"))
 }
 
 func checkpointTurnHasReplayActivity(stream *ActiveStream) bool {
@@ -986,6 +1158,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 		}
 		return fmt.Errorf("pending exec not found")
 	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
+	}
 	service.observeBackgroundShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	service.observeShellExecClientMessage(stream, pending, intent.ExecClientMessage)
 	pending = service.applyExecProgress(stream, pending, intent.ExecClientMessage)
@@ -1016,6 +1191,9 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	}
 	if !result.IsTerminal {
 		return nil
+	}
+	if err := service.persistExecContentBlobs(result.ContentBlobs); err != nil {
+		return err
 	}
 	markExecCompleted(stream, pending)
 	backgroundShellToolCallID := ""
@@ -1055,6 +1233,21 @@ func (service *Service) handleExecResult(intent InboundIntent) error {
 	return service.reconcileStream(stream)
 }
 
+func (service *Service) persistExecContentBlobs(blobs []execbridge.ContentBlob) error {
+	if len(blobs) == 0 {
+		return nil
+	}
+	if service == nil || service.contentBlobs == nil {
+		return fmt.Errorf("content blob store is not initialized")
+	}
+	for _, blob := range blobs {
+		if err := service.contentBlobs.Put(blob.ID, blob.Data); err != nil {
+			return fmt.Errorf("persist exec content blob: %w", err)
+		}
+	}
+	return nil
+}
+
 // handleExecControl 处理执行桥控制面结果，例如 stream_close 或 throw。
 func (service *Service) handleExecControl(intent InboundIntent) error {
 	stream, ok := service.broker.Get(intent.RequestID)
@@ -1078,6 +1271,9 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 	if isHiddenPatchEditExecKind(pending.ExecKind) {
 		return service.handleHiddenPatchEditExecControl(stream, pending, intent.ExecClientControlMessage)
 	}
+	if strings.TrimSpace(pending.ExecKind) == "shell" {
+		clearStreamTimer(stream, providerTimerKey(streamTimerShellDispatch, pending.ExecID))
+	}
 	if isHiddenWriteExecKind(pending.ExecKind) {
 		return service.handleHiddenWriteExecControl(stream, pending, intent.ExecClientControlMessage)
 	}
@@ -1086,6 +1282,10 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	if !result.IsTerminal {
+		if isPreCompactHookStreamClose(intent.ExecClientControlMessage, pending) {
+			markExecCompleted(stream, pending)
+			return service.handlePreCompactTerminal(stream, pending.ProviderPass, "")
+		}
 		if shouldRecoverNonStreamingExecOnStreamClose(intent.ExecClientControlMessage, pending) {
 			markExecTransportClosed(stream, pending)
 			service.scheduleNonStreamingExecRecovery(intent.RequestID, pending)
@@ -1124,6 +1324,18 @@ func (service *Service) handleExecControl(intent InboundIntent) error {
 		return err
 	}
 	return service.reconcileStream(stream)
+}
+
+func isPreCompactHookStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
+	if message == nil || strings.TrimSpace(pending.ExecKind) != "execute_hook_pre_compact" {
+		return false
+	}
+	switch message.GetMessage().(type) {
+	case *agentv1.ExecClientControlMessage_StreamClose:
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldRecoverNonStreamingExecOnStreamClose(message *agentv1.ExecClientControlMessage, pending runtimecore.PendingExec) bool {
@@ -1354,9 +1566,7 @@ func (service *Service) handleMetadataIntent(intent InboundIntent) error {
 	return nil
 }
 
-func (service *Service) scheduleProviderResume(stream *ActiveStream, _ int) error {
-	return service.requestProviderAction(stream, providerActionResume)
-}
+
 
 func shouldResumeAfterToolResults(finishReason string) bool {
 	switch strings.TrimSpace(finishReason) {
@@ -1367,12 +1577,7 @@ func shouldResumeAfterToolResults(finishReason string) bool {
 	}
 }
 
-func (service *Service) cancelScheduledProviderResume(stream *ActiveStream) {
-	if stream == nil {
-		return
-	}
-	clearStreamTimer(stream, providerTimerKey(streamTimerProviderResume, ""))
-}
+
 
 // driveProvider 由 actor 触发一次 provider pass，并把真实流包装成 provider_event 回投 mailbox。
 func (service *Service) driveProvider(stream *ActiveStream) error {
@@ -1431,7 +1636,12 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
 	}
+	compileStartedAt := time.Now().UTC()
 	compiled, err := service.compiler.Compile(conversation, mode, latestUserText, modelName)
+	compileDurationMS := time.Since(compileStartedAt).Milliseconds()
+	if compileDurationMS < 0 {
+		compileDurationMS = 0
+	}
 	if err != nil {
 		service.setTurnPhase(stream, TurnPhaseFailed)
 		return service.failStream(stream, "unknown", err)
@@ -1470,11 +1680,19 @@ func (service *Service) driveProvider(stream *ActiveStream) error {
 		return service.failStream(stream, "unknown", err)
 	}
 	maxTokens, requestKnobs := service.resolveProviderOutputBudget(modelID, conversation, compiled)
+	estimatedPromptTokens := readInt64Value(requestKnobs["compiled_prompt_tokens_estimate"])
 	service.maybeSaveLastAgentModelHash(conversation, modelID, mode, currentPass)
 	ctx, cancel := context.WithCancel(context.Background())
 	stream.mu.Lock()
 	stream.ProviderActive = true
 	stream.ProviderCancel = cancel
+	stream.ProviderUsage = turnUsageSnapshot{
+		ProviderPass:          currentPass,
+		CompileDurationMS:     compileDurationMS,
+		EstimatedPromptTokens: estimatedPromptTokens,
+		ReplayMessageCount:    len(compiled.Messages) - 1,
+		RequestPreparedAt:     time.Now().UTC(),
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 	service.setTurnPhase(stream, TurnPhaseProviderRunning)
@@ -1731,7 +1949,7 @@ func (service *Service) runProviderStream(stream *ActiveStream, token uint64, ct
 
 // handleToolInvocation 把模型产生的工具意图转成 exec/interaction 请求并下发给客户端。
 func (service *Service) handleToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) error {
-	if err := providerLoopInterruptErr(nil, stream, invocation.ModelCallID); err != nil {
+	if err := providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID); err != nil {
 		return err
 	}
 	invocation = service.rewriteDirectMCPToolInvocation(stream, invocation)
@@ -1802,7 +2020,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 	startedToolCall := buildStartedToolCall(invocation)
 	startedEmitted := suppressStartedToolCall
 	ensureLoopActive := func() error {
-		return providerLoopInterruptErr(nil, stream, invocation.ModelCallID)
+		return providerLoopInterruptErr(context.TODO(), stream, invocation.ModelCallID)
 	}
 	if startedToolCall != nil {
 		if err := ensureLoopActive(); err != nil {
@@ -1863,6 +2081,7 @@ func (service *Service) handleToolInvocation(stream *ActiveStream, invocation ru
 		pendingExec.ProviderPass = stream.ProviderPassCount
 		stream.PendingExecs[pendingExec.ExecID] = pendingExec
 		stream.mu.Unlock()
+		service.scheduleShellDispatchRecovery(stream.RequestID, pendingExec)
 		service.scheduleShellForegroundRecovery(stream.RequestID, pendingExec)
 		removePendingExec := func() {
 			stream.mu.Lock()
@@ -2000,19 +2219,67 @@ func (service *Service) appendToolResult(stream *ActiveStream, toolCallID string
 		}
 		payload = encoded
 	}
+	reasoningContent = toolResultReasoningFallback(stream, toolCallID, reasoningContent)
 	_, err := service.appendConversationEntries(stream, stream.ConversationID, []HistoryEntry{
 		newToolResultEntry(stream.TurnSeq, stream.RequestID, toolCallID, toolName, string(argsJSON), resultText, reasoningContent, payload),
 	})
 	return err
 }
 
+func toolResultReasoningFallback(stream *ActiveStream, toolCallID string, reasoningContent string) string {
+	if strings.TrimSpace(reasoningContent) == "" || stream == nil {
+		return reasoningContent
+	}
+	trimmedToolCallID := strings.TrimSpace(toolCallID)
+	if trimmedToolCallID == "" {
+		return reasoningContent
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.CheckpointConversation == nil {
+		return reasoningContent
+	}
+	for _, entry := range stream.CheckpointConversation.Entries {
+		if strings.TrimSpace(entry.Kind) != "tool_call" || strings.TrimSpace(entry.ToolCallID) != trimmedToolCallID {
+			continue
+		}
+		var payload toolCallEntryPayload
+		if err := json.Unmarshal(entry.Payload, &payload); err == nil && (strings.TrimSpace(payload.ReasoningContent) != "" || strings.TrimSpace(payload.ReasoningSignature) != "" || strings.TrimSpace(payload.ReasoningSignatureSource) != "") {
+			return ""
+		}
+	}
+	return reasoningContent
+}
+
 func (service *Service) publishToolCallCompleted(requestID string, toolCallID string, modelCallID string, toolCall *agentv1.ToolCall) error {
-	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(toolCallID) == "" {
+	trimmedRequestID := strings.TrimSpace(requestID)
+	trimmedToolCallID := strings.TrimSpace(toolCallID)
+	if trimmedRequestID == "" || trimmedToolCallID == "" {
 		return nil
 	}
-	return service.broker.Publish(requestID, StreamEvent{
-		Message: buildToolCallCompletedMessage(toolCallID, modelCallID, toolCall),
+	if stream, found := service.broker.Get(trimmedRequestID); found && stream != nil {
+		stream.mu.Lock()
+		if stream.CompletedToolCallIDs == nil {
+			stream.CompletedToolCallIDs = make(map[string]time.Time)
+		}
+		stream.CompletedToolCallIDs[trimmedToolCallID] = time.Now().UTC()
+		stream.UpdatedAt = time.Now().UTC()
+		stream.mu.Unlock()
+	}
+	return service.broker.Publish(trimmedRequestID, StreamEvent{
+		Message: buildToolCallCompletedMessage(trimmedToolCallID, modelCallID, toolCall),
 	})
+}
+
+func completedToolCall(stream *ActiveStream, toolCallID string) bool {
+	trimmedToolCallID := strings.TrimSpace(toolCallID)
+	if stream == nil || trimmedToolCallID == "" {
+		return false
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	_, completed := stream.CompletedToolCallIDs[trimmedToolCallID]
+	return completed
 }
 
 func (service *Service) applyExecProgress(stream *ActiveStream, pending runtimecore.PendingExec, message *agentv1.ExecClientMessage) runtimecore.PendingExec {
@@ -2148,20 +2415,7 @@ func (service *Service) closeStreamWithProviderError(
 	return service.failActiveStream(stream, conversationID, requestID, modelCallID, "provider_error", errorText)
 }
 
-func takePendingProviderCompletion(stream *ActiveStream) (pendingTurnCompletion, bool) {
-	if stream == nil {
-		return pendingTurnCompletion{}, false
-	}
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	if stream.PendingProviderCompletion == nil {
-		return pendingTurnCompletion{}, false
-	}
-	completion := *stream.PendingProviderCompletion
-	stream.PendingProviderCompletion = nil
-	stream.UpdatedAt = time.Now().UTC()
-	return completion, true
-}
+
 
 func pendingBridgeCount(stream *ActiveStream) int {
 	if stream == nil {
@@ -2172,34 +2426,7 @@ func pendingBridgeCount(stream *ActiveStream) int {
 	return len(stream.PendingExecs) + len(stream.PendingInteractions)
 }
 
-func (service *Service) finishDeferredTurnAfterInteraction(stream *ActiveStream, pending runtimecore.PendingInteraction) error {
-	completion, ok := takePendingProviderCompletion(stream)
-	if !ok {
-		stream.mu.Lock()
-		completion = pendingTurnCompletion{
-			ConversationID: stream.ConversationID,
-			RequestID:      stream.RequestID,
-			TurnSeq:        stream.TurnSeq,
-			ModelCallID:    firstNonEmpty(strings.TrimSpace(pending.ModelCallID), strings.TrimSpace(stream.CurrentModelCallID)),
-			ProviderPass:   pending.ProviderPass,
-		}
-		stream.mu.Unlock()
-		log.Printf(
-			"forwarder missing deferred turn completion snapshot request_id=%s tool_call_id=%s interaction_kind=%s provider_pass=%d",
-			strings.TrimSpace(completion.RequestID),
-			strings.TrimSpace(pending.ToolCallID),
-			strings.TrimSpace(pending.InteractionKind),
-			pending.ProviderPass,
-		)
-	}
-	if strings.TrimSpace(completion.ModelCallID) == "" {
-		completion.ModelCallID = strings.TrimSpace(pending.ModelCallID)
-	}
-	if completion.ProviderPass == 0 {
-		completion.ProviderPass = pending.ProviderPass
-	}
-	return service.completeSuccessfulTurn(stream, completion)
-}
+
 
 func (service *Service) completeSuccessfulTurn(stream *ActiveStream, completion pendingTurnCompletion) error {
 	if stream == nil {
@@ -2234,11 +2461,12 @@ func (service *Service) completeSuccessfulTurn(stream *ActiveStream, completion 
 			err,
 		)
 	}
-	return service.publishCheckpointWithCompletion(requestID, conversationID, &completion)
+	_ = service.publishCheckpoint(requestID, conversationID)
+	return service.finishSuccessfulTurnAfterCheckpoint(stream, completion)
 }
 
 func (service *Service) finishSuccessfulTurnAfterCheckpoint(stream *ActiveStream, completion pendingTurnCompletion) error {
-	if stream == nil {
+	if stream == nil || !claimTerminalEvent(stream) {
 		return nil
 	}
 	requestID := firstNonEmpty(strings.TrimSpace(completion.RequestID), strings.TrimSpace(stream.RequestID))
@@ -2253,6 +2481,14 @@ func (service *Service) finishSuccessfulTurnAfterCheckpoint(stream *ActiveStream
 	}
 	service.setTurnPhase(stream, TurnPhaseCompleted)
 	return nil
+}
+
+func (service *Service) finishCanceledTurnAfterCheckpoint(stream *ActiveStream, terminalMessage string) error {
+	if stream == nil || !claimTerminalEvent(stream) {
+		return nil
+	}
+	service.setTurnPhase(stream, TurnPhaseCanceled)
+	return service.broker.Cancel(stream.RequestID, firstNonEmpty(strings.TrimSpace(terminalMessage), "[canceled] User aborted request"))
 }
 
 func (service *Service) finishFailedTurnAfterCheckpoint(stream *ActiveStream, terminalCode string, terminalMessage string) error {
@@ -2452,12 +2688,9 @@ func (service *Service) failActiveStream(stream *ActiveStream, conversationID st
 			err,
 		)
 	}
-	terminal := failedCheckpointTerminalAction(terminalCode, terminalMessage)
-	if err := service.publishCheckpointWithTerminalAction(requestID, terminal); err != nil {
-		log.Printf("forwarder checkpoint queue before failed terminal skipped request_id=%s err=%v", strings.TrimSpace(requestID), err)
-		return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
-	}
-	return nil
+	service.discardPendingCheckpoint(stream, "stream failed")
+	_ = service.publishCheckpoint(requestID, conversationID)
+	return service.finishFailedTurnAfterCheckpoint(stream, terminalCode, terminalMessage)
 }
 
 // buildRunEntries 构造一次 run intent 需要写入 history 的首批 entry。
@@ -2477,6 +2710,33 @@ func buildRunEntries(intent InboundIntent, effectiveMode agentv1.AgentMode, turn
 				Kind:      "request_context",
 				Payload:   payload,
 			})
+		}
+	}
+	for _, prependMsg := range intent.PrependUserMessages {
+		if prependMsg == nil {
+			continue
+		}
+		if intent.UserMessage != nil && strings.TrimSpace(prependMsg.GetMessageId()) != "" && strings.TrimSpace(prependMsg.GetMessageId()) == strings.TrimSpace(intent.UserMessage.GetMessageId()) {
+			continue
+		}
+		normalized := normalizeUserMessageForStorage(prependMsg)
+		payload, err := protojson.Marshal(normalized)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, HistoryEntry{
+			TurnSeq:   turnSeq,
+			RequestID: intent.RequestID,
+			Role:      "user",
+			Kind:      "user_message",
+			Payload:   payload,
+		})
+		if commandMessage, ok := promptengine.BuildSelectedCursorCommandsReplayMessage(normalized); ok {
+			entries = append(entries, newPromptContextEntry(turnSeq, intent.RequestID, newPromptContextMessage(
+				promptContextSourceSelectedCursorCommands,
+				modeladapter.Message{Role: commandMessage.Role, Content: commandMessage.Content},
+				true,
+			)))
 		}
 	}
 	if intent.UserMessage != nil {
@@ -2654,31 +2914,105 @@ func extractUserMessage(message *agentv1.AgentClientMessage) *agentv1.UserMessag
 	}
 	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetUserMessage()
+		if userMsg := item.UserMessageAction.GetUserMessage(); userMsg != nil {
+			return userMsg
+		}
+		if prepends := item.UserMessageAction.GetPrependUserMessages(); len(prepends) > 0 {
+			return prepends[len(prepends)-1]
+		}
+		return nil
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
 	default:
 		return nil
 	}
 }
 
-// extractRequestContext 从 legacy 请求中提取 request_context。
-func extractRequestContext(message *agentv1.AgentClientMessage) *agentv1.RequestContext {
+// extractPrependUserMessages 从 legacy run_request 中提取 prepend 用户消息列表。
+func extractPrependUserMessages(message *agentv1.AgentClientMessage) []*agentv1.UserMessage {
 	if message == nil || message.GetRunRequest() == nil || message.GetRunRequest().GetAction() == nil {
 		return nil
 	}
 	switch item := message.GetRunRequest().GetAction().GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetRequestContext()
-	case *agentv1.ConversationAction_ResumeAction:
-		return item.ResumeAction.GetRequestContext()
-	case *agentv1.ConversationAction_StartPlanAction:
-		return item.StartPlanAction.GetRequestContext()
-	case *agentv1.ConversationAction_ExecutePlanAction:
-		return item.ExecutePlanAction.GetRequestContext()
+		return item.UserMessageAction.GetPrependUserMessages()
 	default:
 		return nil
 	}
+}
+
+// extractRequestContext 提取 request_context，优先兼容现代 Cursor 的 RequestContextParts.DynamicContext，
+// 并与 action 中可能包含的 legacy context 自动做防御性合并。
+func extractRequestContext(message *agentv1.AgentClientMessage) *agentv1.RequestContext {
+	if message == nil || message.GetRunRequest() == nil || message.GetRunRequest().GetAction() == nil {
+		return nil
+	}
+	action := message.GetRunRequest().GetAction()
+
+	var legacyContext *agentv1.RequestContext
+	switch item := action.GetAction().(type) {
+	case *agentv1.ConversationAction_UserMessageAction:
+		legacyContext = item.UserMessageAction.GetRequestContext()
+	case *agentv1.ConversationAction_ResumeAction:
+		legacyContext = item.ResumeAction.GetRequestContext()
+	case *agentv1.ConversationAction_StartPlanAction:
+		legacyContext = item.StartPlanAction.GetRequestContext()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		legacyContext = item.ExecutePlanAction.GetRequestContext()
+	}
+
+	parts := action.GetRequestContextParts()
+	if parts != nil && parts.GetDynamicContext() != nil {
+		dynamic := parts.GetDynamicContext()
+		if legacyContext == nil {
+			return dynamic
+		}
+		return mergeRequestContexts(dynamic, legacyContext)
+	}
+	return legacyContext
+}
+
+func mergeRequestContexts(dynamic *agentv1.RequestContext, legacy *agentv1.RequestContext) *agentv1.RequestContext {
+	if dynamic == nil {
+		return legacy
+	}
+	if legacy == nil {
+		return dynamic
+	}
+	merged, ok := proto.Clone(dynamic).(*agentv1.RequestContext)
+	if !ok || merged == nil {
+		merged = dynamic
+	}
+	if merged.GetEnv() == nil && legacy.GetEnv() != nil {
+		merged.Env = legacy.GetEnv()
+	}
+	if len(merged.GetGitRepos()) == 0 && len(legacy.GetGitRepos()) > 0 {
+		merged.GitRepos = legacy.GetGitRepos()
+	}
+	if len(merged.GetAgentSkills()) == 0 && len(legacy.GetAgentSkills()) > 0 {
+		merged.AgentSkills = legacy.GetAgentSkills()
+	}
+	if merged.GetSkillOptions() == nil && legacy.GetSkillOptions() != nil {
+		merged.SkillOptions = legacy.GetSkillOptions()
+	}
+	if len(merged.GetCustomSubagents()) == 0 && len(legacy.GetCustomSubagents()) > 0 {
+		merged.CustomSubagents = legacy.GetCustomSubagents()
+	}
+	if len(merged.GetRules()) == 0 && len(legacy.GetRules()) > 0 {
+		merged.Rules = legacy.GetRules()
+	}
+	if len(merged.GetNonFileRules()) == 0 && len(legacy.GetNonFileRules()) > 0 {
+		merged.NonFileRules = legacy.GetNonFileRules()
+	}
+	if merged.GetMcpMetaToolOptions() == nil && legacy.GetMcpMetaToolOptions() != nil {
+		merged.McpMetaToolOptions = legacy.GetMcpMetaToolOptions()
+	}
+	if merged.GetMcpFileSystemOptions() == nil && legacy.GetMcpFileSystemOptions() != nil {
+		merged.McpFileSystemOptions = legacy.GetMcpFileSystemOptions()
+	}
+	return merged
 }
 
 func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runRequest *agentv1.AgentRunRequest, userMessage *agentv1.UserMessage, requestContext *agentv1.RequestContext) bool {
@@ -2693,8 +3027,14 @@ func (service *Service) shouldIgnoreEmptyResumeRunRequest(requestID string, runR
 		return false
 	}
 	conversationID := strings.TrimSpace(runRequest.GetConversationId())
-	if conversationID == "" || service.hasActiveConversationStream(conversationID, requestID) {
+	if conversationID == "" {
 		return false
+	}
+	// A reconnect may issue a payload-free resume while the original turn is
+	// still active. It carries no work to resume, so accepting it would create
+	// a new run that immediately cancels the active one as "superseded".
+	if service.hasActiveConversationStream(conversationID, requestID) {
+		return true
 	}
 	conversation, err := service.loadConversationForResumeGuard(conversationID)
 	if err != nil || conversation == nil {
@@ -2769,9 +3109,29 @@ func extractConversationActionUserMessage(action *agentv1.ConversationAction) *a
 	}
 	switch item := action.GetAction().(type) {
 	case *agentv1.ConversationAction_UserMessageAction:
-		return item.UserMessageAction.GetUserMessage()
+		if userMsg := item.UserMessageAction.GetUserMessage(); userMsg != nil {
+			return userMsg
+		}
+		if prepends := item.UserMessageAction.GetPrependUserMessages(); len(prepends) > 0 {
+			return prepends[len(prepends)-1]
+		}
+		return nil
 	case *agentv1.ConversationAction_StartPlanAction:
 		return item.StartPlanAction.GetUserMessage()
+	case *agentv1.ConversationAction_ExecutePlanAction:
+		return &agentv1.UserMessage{Text: executePlanDirective}
+	default:
+		return nil
+	}
+}
+
+func extractConversationActionPrependUserMessages(action *agentv1.ConversationAction) []*agentv1.UserMessage {
+	if action == nil {
+		return nil
+	}
+	switch item := action.GetAction().(type) {
+	case *agentv1.ConversationAction_UserMessageAction:
+		return item.UserMessageAction.GetPrependUserMessages()
 	default:
 		return nil
 	}
@@ -2994,6 +3354,24 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 	if effort := normalizeRuntimeThinkingEffort(text); effort != "" {
 		return "", effort
 	}
+	if idx := strings.Index(text, "["); idx > 0 {
+		modelID := strings.TrimSpace(text[:idx])
+		bracketContent := text[idx+1:]
+		if end := strings.Index(bracketContent, "]"); end >= 0 {
+			bracketContent = bracketContent[:end]
+		}
+		effort := ""
+		for _, part := range strings.Split(bracketContent, ",") {
+			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+			if len(kv) == 2 {
+				k := strings.ToLower(strings.TrimSpace(kv[0]))
+				if isRuntimeThinkingEffortParameterID(k) {
+					effort = normalizeRuntimeThinkingEffort(kv[1])
+				}
+			}
+		}
+		return modelID, effort
+	}
 	index := strings.LastIndex(text, ":")
 	if index <= 0 || index >= len(text)-1 {
 		return "", ""
@@ -3004,6 +3382,88 @@ func splitRuntimeThinkingEffortVariantString(raw string) (string, string) {
 		return "", ""
 	}
 	return modelID, effort
+}
+
+func extractRequestedContextTokens(message *agentv1.AgentClientMessage) uint32 {
+	if message == nil {
+		return 0
+	}
+	if runRequest := message.GetRunRequest(); runRequest != nil {
+		return extractRequestedContextTokensFromRequestedModel(runRequest.GetRequestedModel())
+	}
+	if prewarm := message.GetPrewarmRequest(); prewarm != nil {
+		return extractRequestedContextTokensFromRequestedModel(prewarm.GetRequestedModel())
+	}
+	return 0
+}
+
+func extractRequestedContextTokensFromRequestedModel(model *agentv1.RequestedModel) uint32 {
+	if model == nil {
+		return 0
+	}
+	for _, parameter := range model.GetParameters() {
+		if parameter == nil {
+			continue
+		}
+		if isContextParameterID(parameter.GetId()) {
+			if tokens := parseContextTokenCount(parameter.GetValue()); tokens > 0 {
+				return tokens
+			}
+		}
+	}
+	if model.GetIsVariantStringRepresentation() {
+		text := strings.TrimSpace(model.GetModelId())
+		if idx := strings.Index(text, "["); idx > 0 {
+			bracketContent := text[idx+1:]
+			if end := strings.Index(bracketContent, "]"); end >= 0 {
+				bracketContent = bracketContent[:end]
+			}
+			for _, part := range strings.Split(bracketContent, ",") {
+				kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+				if len(kv) == 2 {
+					if isContextParameterID(kv[0]) {
+						if tokens := parseContextTokenCount(kv[1]); tokens > 0 {
+							return tokens
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func isContextParameterID(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "context", "context_window", "context_window_tokens", "contextwindowtokens", "context_size", "contextsize":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseContextTokenCount(value string) uint32 {
+	val := strings.ToLower(strings.TrimSpace(value))
+	if val == "" {
+		return 0
+	}
+	multiplier := uint64(1)
+	if strings.HasSuffix(val, "k") {
+		multiplier = 1_000
+		val = strings.TrimSuffix(val, "k")
+	} else if strings.HasSuffix(val, "m") {
+		multiplier = 1_000_000
+		val = strings.TrimSuffix(val, "m")
+	}
+	num, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0
+	}
+	tokens := num * multiplier
+	if tokens > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(tokens)
 }
 
 func (service *Service) resolveRequestedModelName(message *agentv1.AgentClientMessage, modelID string) string {
@@ -3049,6 +3509,9 @@ func (service *Service) resolveContextWindowTokens(modelID string) uint32 {
 
 func (service *Service) syncConversationContextWindowTokens(stream *ActiveStream, conversationID string, conversation *ConversationFile) (*ConversationFile, error) {
 	if stream == nil || conversation == nil {
+		return conversation, nil
+	}
+	if conversation.TokenDetailsMaxTokens > 0 {
 		return conversation, nil
 	}
 	stream.mu.Lock()
@@ -3210,6 +3673,9 @@ func buildPendingToolCalls(pendingExecs []runtimecore.PendingExec, pendingIntera
 
 	items := make([]pendingToolCallReplay, 0, len(pendingExecs)+len(pendingInteractions))
 	for _, pending := range pendingExecs {
+		if isHiddenWriteExecKind(pending.ExecKind) || isHiddenPatchEditExecKind(pending.ExecKind) {
+			continue
+		}
 		raw, ok := encodePendingExecAsAssistantOutput(pending)
 		if !ok {
 			continue
@@ -3395,36 +3861,51 @@ func recentlyCompletedExecExists(stream *ActiveStream, messageID uint32) bool {
 }
 
 func (service *Service) updateStreamMCPToolServers(stream *ActiveStream, requestContext *agentv1.RequestContext) {
-	if stream == nil {
+	if stream == nil || !hasMCPDescriptorSnapshot(requestContext) {
 		return
 	}
 	servers := collectMCPToolServers(requestContext)
-	if len(servers) == 0 {
+	stream.mu.Lock()
+	stream.MCPToolServers = cloneStringMap(servers)
+	stream.UpdatedAt = time.Now().UTC()
+	stream.mu.Unlock()
+}
+
+func hasMCPDescriptorSnapshot(requestContext *agentv1.RequestContext) bool {
+	return requestContext != nil &&
+		(requestContext.GetMcpFileSystemOptions() != nil || requestContext.GetMcpMetaToolOptions() != nil)
+}
+
+func snapshotStreamMCPToolServers(stream *ActiveStream) map[string]string {
+	if stream == nil {
+		return nil
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return cloneStringMap(stream.MCPToolServers)
+}
+
+func hydrateStreamMCPToolServers(stream *ActiveStream, servers map[string]string) {
+	if stream == nil {
 		return
 	}
 	stream.mu.Lock()
-	if stream.MCPToolServers == nil {
-		stream.MCPToolServers = make(map[string]string, len(servers))
-	}
-	for toolName, serverIdentifier := range servers {
-		trimmedToolName := strings.TrimSpace(toolName)
-		trimmedServerIdentifier := strings.TrimSpace(serverIdentifier)
-		if trimmedToolName == "" || trimmedServerIdentifier == "" {
-			continue
-		}
-		stream.MCPToolServers[trimmedToolName] = trimmedServerIdentifier
-	}
+	stream.MCPToolServers = cloneStringMap(servers)
 	stream.UpdatedAt = time.Now().UTC()
 	stream.mu.Unlock()
 }
 
 func (service *Service) rewriteDirectMCPToolInvocation(stream *ActiveStream, invocation runtimecore.ToolInvocation) runtimecore.ToolInvocation {
-	toolName := strings.TrimSpace(invocation.ToolName)
-	if toolName == "" || isExecTool(toolName) {
+	requestedToolName := strings.TrimSpace(invocation.ToolName)
+	if requestedToolName == "" || isExecTool(requestedToolName) {
 		return invocation
 	}
-	serverIdentifier := lookupMCPToolServer(stream, toolName)
+	serverIdentifier := lookupMCPToolServer(stream, requestedToolName)
 	if serverIdentifier == "" {
+		return invocation
+	}
+	toolName := runtimecore.InferMCPToolName(serverIdentifier, requestedToolName)
+	if toolName == "" {
 		return invocation
 	}
 
@@ -3473,6 +3954,15 @@ func (service *Service) normalizeCallMCPToolInvocation(stream *ActiveStream, inv
 		}
 	}
 
+	if serverIdentifier != "" {
+		if resolvedServer := lookupMCPToolServer(stream, serverIdentifier); resolvedServer != "" {
+			serverIdentifier = resolvedServer
+		}
+		if resolvedServer := lookupMCPToolServer(stream, forwarderCanonicalMCPToolLookupName(serverIdentifier, toolName)); resolvedServer != "" {
+			serverIdentifier = resolvedServer
+		}
+		toolName = runtimecore.InferMCPToolName(serverIdentifier, firstNonEmpty(name, toolName))
+	}
 	if toolName == "" {
 		return invocation
 	}
@@ -3518,16 +4008,7 @@ func readStringAny(value any) string {
 	return strings.TrimSpace(text)
 }
 
-func readMapAny(value any) map[string]any {
-	switch item := value.(type) {
-	case map[string]any:
-		return item
-	case nil:
-		return map[string]any{}
-	default:
-		return map[string]any{}
-	}
-}
+
 
 // inferToolName 从完整 ToolCall proto 中反推出 canonical 工具名。
 func inferToolName(toolCall *agentv1.ToolCall) string {
@@ -3620,42 +4101,7 @@ func deriveToolNameFromPendingExec(pending runtimecore.PendingExec) string {
 	}
 }
 
-func execKindFromToolName(name string) (string, bool) {
-	switch strings.TrimSpace(name) {
-	case "Read":
-		return "read", true
-	case "Write":
-		return "write", true
-	case "PatchEdit":
-		return "patch_edit", true
-	case "Delete":
-		return "delete", true
-	case "Glob":
-		return "glob", true
-	case "Grep":
-		return "grep", true
-	case "Ls":
-		return "ls", true
-	case "ReadLints":
-		return "diagnostics", true
-	case "CallMcpTool":
-		return "mcp", true
-	case "FetchMcpResource":
-		return "read_mcp_resource", true
-	case "Shell":
-		return "shell", true
-	case "AwaitShell":
-		return "await_shell", true
-	case "WriteShellStdin":
-		return "write_shell_stdin", true
-	case "ForceBackgroundShell":
-		return "force_background_shell", true
-	case "Task":
-		return "subagent", true
-	default:
-		return "", false
-	}
-}
+
 
 func isExecTool(name string) bool {
 	switch strings.TrimSpace(name) {

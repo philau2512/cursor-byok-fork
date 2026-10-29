@@ -39,6 +39,7 @@ type ConversationFile struct {
 	CurrentPlanText                 string                                `json:"current_plan_text,omitempty"`
 	CurrentPlans                    map[string]*agentv1.PlanRegistryEntry `json:"current_plans,omitempty"`
 	CurrentTodos                    []*agentv1.TodoItem                   `json:"current_todos,omitempty"`
+	MCPToolServers                  map[string]string                     `json:"mcp_tool_servers,omitempty"`
 	ImportedTurnIDs                 [][]byte                              `json:"imported_turn_ids,omitempty"`
 	LatestRequestPrefix             *ConversationRequestPrefix            `json:"latest_request_prefix,omitempty"`
 	LastProviderCall                *ConversationProviderCall             `json:"last_provider_call,omitempty"`
@@ -67,13 +68,22 @@ type ConversationRequestPrefix struct {
 }
 
 type ConversationProviderCall struct {
-	RequestID   string    `json:"request_id,omitempty"`
-	ModelCallID string    `json:"model_call_id,omitempty"`
-	Provider    string    `json:"provider,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	Status      string    `json:"status,omitempty"`
-	ErrorText   string    `json:"error_text,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+	RequestID               string    `json:"request_id,omitempty"`
+	ModelCallID             string    `json:"model_call_id,omitempty"`
+	Provider                string    `json:"provider,omitempty"`
+	Model                   string    `json:"model,omitempty"`
+	ProviderPass            int       `json:"provider_pass,omitempty"`
+	CompileDurationMS       int64     `json:"compile_duration_ms,omitempty"`
+	EstimatedPromptTokens   int64     `json:"estimated_prompt_tokens,omitempty"`
+	ReplayMessageCount      int       `json:"replay_message_count,omitempty"`
+	TTFTMS                  int64     `json:"ttft_ms,omitempty"`
+	DurationMS              int64     `json:"duration_ms,omitempty"`
+	CacheReadTokens         int64     `json:"cache_read_tokens,omitempty"`
+	CacheReadUsageAvailable bool      `json:"cache_read_usage_available,omitempty"`
+	FirstEventAt            time.Time `json:"first_event_at,omitempty"`
+	Status                  string    `json:"status,omitempty"`
+	ErrorText               string    `json:"error_text,omitempty"`
+	UpdatedAt               time.Time `json:"updated_at,omitempty"`
 }
 
 type HistoryEntry struct {
@@ -117,6 +127,7 @@ type StreamEvent struct {
 
 type StreamSubscriber struct {
 	Signal chan struct{}
+	Cursor int
 }
 
 type manualCompactionDirective struct {
@@ -136,6 +147,7 @@ type ActiveStream struct {
 	LatestUserText         string
 	ManualCompaction       manualCompactionDirective
 	Status                 StreamStatus
+	TerminalActionClaimed  bool
 	ThinkingEffort         string
 	SubagentModelOverrides map[string]runtimecore.SubagentModelOverrideSelection
 
@@ -165,17 +177,20 @@ type ActiveStream struct {
 	ProviderUsage                               turnUsageSnapshot
 	ProviderTerminalToolInvocation              bool
 	PendingCompaction                           *PendingCompaction
-	PendingCheckpointBlobWrites                 map[uint32]string
+	PendingCheckpointBlobWrites                 map[uint32]pendingCheckpointBlobWrite
 	ConfirmedCheckpointBlobs                    map[string]struct{}
 	NextCheckpointBlobRequestID                 uint32
+	CheckpointGeneration                        uint64
 	PendingCheckpoint                           *pendingCheckpointPublish
 
 	Backlog                     []StreamEvent
+	BacklogBaseCursor           int
 	Subscribers                 map[string]*StreamSubscriber
 	CheckpointConversation      *ConversationFile
 	PendingExecs                map[string]runtimecore.PendingExec
 	PendingInteractions         map[string]runtimecore.PendingInteraction
 	PartialToolCallIDs          map[string]struct{}
+	CompletedToolCallIDs        map[string]time.Time
 	PatchEditQueues             map[string][]queuedPatchEditOperation
 	MCPToolServers              map[string]string
 	WorkspacePaths              []string
@@ -241,9 +256,13 @@ type checkpointTerminalAction struct {
 }
 
 type pendingCheckpointPublish struct {
-	State    *agentv1.ConversationStateStructure
-	Required map[string]struct{}
-	Terminal checkpointTerminalAction
+	Generation     uint64
+	QueuedAt       time.Time
+	TotalBlobBytes int
+	NewBlobCount   int
+	State          *agentv1.ConversationStateStructure
+	Required       map[string]struct{}
+	Terminal       checkpointTerminalAction
 }
 
 type PendingCompaction struct {
@@ -437,6 +456,7 @@ type InboundIntent struct {
 	ModelID                  string
 	ModelName                string
 	ThinkingEffort           string
+	RequestedContextTokens   uint32
 	Mode                     agentv1.AgentMode
 	HasExplicitMode          bool
 	ModeSource               ModeSource
@@ -446,6 +466,7 @@ type InboundIntent struct {
 	SubagentModelOverrides   map[string]runtimecore.SubagentModelOverrideSelection
 	ConversationState        *agentv1.ConversationStateStructure
 	PreFetchedBlobs          []*agentv1.PreFetchedBlob
+	PrependUserMessages      []*agentv1.UserMessage
 	UserMessage              *agentv1.UserMessage
 	RequestContext           *agentv1.RequestContext
 	ClientMessage            *agentv1.AgentClientMessage

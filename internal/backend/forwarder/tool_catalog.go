@@ -10,6 +10,47 @@ import (
 	promptassets "cursor/prompt"
 )
 
+type cachedToolCatalogEntry struct {
+	items []json.RawMessage
+	names []string
+}
+
+var (
+	cachedToolCatalogs = make(map[promptassets.Mode]cachedToolCatalogEntry)
+)
+
+func init() {
+	for _, mode := range []promptassets.Mode{
+		promptassets.ModeAsk,
+		promptassets.ModePlan,
+		promptassets.ModeAgent,
+		promptassets.ModeDebug,
+		promptassets.ModeMultitask,
+		promptassets.ModeSubagent,
+	} {
+		rawTools, err := promptassets.ReadTools(mode)
+		if err != nil {
+			continue
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(rawTools, &items); err != nil {
+			continue
+		}
+		names := make([]string, 0, len(items))
+		for _, item := range items {
+			name, err := extractToolName(item)
+			if err != nil {
+				continue
+			}
+			names = append(names, name)
+		}
+		cachedToolCatalogs[mode] = cachedToolCatalogEntry{
+			items: items,
+			names: names,
+		}
+	}
+}
+
 type DefaultToolCatalog struct {
 }
 
@@ -24,21 +65,30 @@ func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName
 	if err != nil {
 		return nil, nil, err
 	}
-	rawTools, err := promptassets.ReadTools(assetMode)
-	if err != nil {
-		return nil, nil, err
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(rawTools, &items); err != nil {
-		return nil, nil, fmt.Errorf("decode tools asset failed: %w", err)
-	}
-	filtered := make([]json.RawMessage, 0, len(items))
-	names := make([]string, 0, len(items))
-	for _, item := range items {
-		name, err := extractToolName(item)
+	cached, ok := cachedToolCatalogs[assetMode]
+	if !ok {
+		rawTools, err := promptassets.ReadTools(assetMode)
 		if err != nil {
 			return nil, nil, err
 		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(rawTools, &items); err != nil {
+			return nil, nil, fmt.Errorf("decode tools asset failed: %w", err)
+		}
+		cached = cachedToolCatalogEntry{items: items}
+		for _, item := range items {
+			name, err := extractToolName(item)
+			if err != nil {
+				return nil, nil, err
+			}
+			cached.names = append(cached.names, name)
+		}
+	}
+
+	filtered := make([]json.RawMessage, 0, len(cached.items))
+	names := make([]string, 0, len(cached.names))
+	for i, item := range cached.items {
+		name := cached.names[i]
 		if !isToolAllowedInMode(mode, subagentTypeName, name) {
 			continue
 		}
@@ -51,6 +101,7 @@ func (catalog *DefaultToolCatalog) Load(mode agentv1.AgentMode, subagentTypeName
 var agentModeToolNames = map[string]struct{}{
 	"AskQuestion":          {},
 	"CallMcpTool":          {},
+	"CreatePlan":           {},
 	"Delete":               {},
 	"FetchMcpResource":     {},
 	"GenerateImage":        {},
@@ -144,10 +195,12 @@ var planModeToolNames = map[string]struct{}{
 	"AskQuestion":          {},
 	"CallMcpTool":          {},
 	"CreatePlan":           {},
+	"Delete":               {},
 	"FetchMcpResource":     {},
 	"Glob":                 {},
 	"Grep":                 {},
 	"Ls":                   {},
+	"PatchEdit":            {},
 	"Read":                 {},
 	"ReadLints":            {},
 	"Shell":                {},
@@ -158,6 +211,7 @@ var planModeToolNames = map[string]struct{}{
 	"TodoWrite":            {},
 	"WebFetch":             {},
 	"WebSearch":            {},
+	"Write":                {},
 }
 
 var childConversationDisallowedAgentToolNames = map[string]struct{}{
@@ -224,29 +278,7 @@ func isChildConversationSubagentTypeName(subagentTypeName string) bool {
 	return strings.TrimSpace(subagentTypeName) != ""
 }
 
-func selectToolsByOrderedNames(items []json.RawMessage, orderedNames []string) ([]json.RawMessage, []string, error) {
-	byName := make(map[string]json.RawMessage, len(items))
-	for _, item := range items {
-		name, err := extractToolName(item)
-		if err != nil {
-			return nil, nil, err
-		}
-		if _, exists := byName[name]; !exists {
-			byName[name] = item
-		}
-	}
-	filtered := make([]json.RawMessage, 0, len(orderedNames))
-	names := make([]string, 0, len(orderedNames))
-	for _, name := range orderedNames {
-		item, ok := byName[name]
-		if !ok {
-			return nil, nil, fmt.Errorf("tool descriptor %q not found in prompt asset", name)
-		}
-		filtered = append(filtered, item)
-		names = append(names, name)
-	}
-	return filtered, names, nil
-}
+
 
 func toolAssetModeForConversation(mode agentv1.AgentMode, subagentTypeName string) (promptassets.Mode, error) {
 	if isChildConversationSubagentTypeName(subagentTypeName) {

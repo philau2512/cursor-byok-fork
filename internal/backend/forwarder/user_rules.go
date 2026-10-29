@@ -237,12 +237,13 @@ func (store *UserRuleStore) BuildSystemPromptSection() (string, int, int, error)
 	}
 	visibleCount := 0
 	for _, record := range records {
-		if strings.TrimSpace(record.Knowledge) == "" {
+		body := parseUserRuleFrontmatter(record.Knowledge).Body
+		if strings.TrimSpace(body) == "" {
 			continue
 		}
 		lines = append(lines,
 			fmt.Sprintf(`<rule file="%s">`, escapeSharedRulePromptText(record.Filename)),
-			escapeSharedRulePromptText(record.Knowledge),
+			escapeSharedRulePromptText(body),
 			"</rule>",
 		)
 		visibleCount++
@@ -254,6 +255,24 @@ func (store *UserRuleStore) BuildSystemPromptSection() (string, int, int, error)
 	return strings.Join(lines, "\n"), totalFiles, visibleCount, nil
 }
 
+func parseUserRuleFrontmatter(knowledge string) struct {
+	Body string
+} {
+	trimmed := strings.TrimSpace(knowledge)
+	if !strings.HasPrefix(trimmed, "---") {
+		return struct{ Body string }{Body: trimmed}
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
+		return struct{ Body string }{Body: trimmed}
+	}
+	for index := 1; index < len(lines); index++ {
+		if strings.TrimSpace(lines[index]) == "---" {
+			return struct{ Body string }{Body: strings.TrimSpace(strings.Join(lines[index+1:], "\n"))}
+		}
+	}
+	return struct{ Body string }{Body: trimmed}
+}
 func (store *UserRuleStore) listGroupsLocked() ([]userRuleGroup, error) {
 	records, err := store.scanRuleFilesLocked()
 	if err != nil {

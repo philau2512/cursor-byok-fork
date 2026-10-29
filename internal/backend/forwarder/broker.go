@@ -13,19 +13,29 @@ import (
 )
 
 const subscriberSignalBufferSize = 1
+const defaultStreamBacklogLimit = 1024
 const orphanSubscriberGracePeriod = 30 * time.Second
 const terminalStreamRetentionPeriod = 30 * time.Second
 
 type StreamBroker struct {
-	mu      sync.RWMutex
-	streams map[string]*ActiveStream
-	nextID  atomic.Uint64
+	mu           sync.RWMutex
+	streams      map[string]*ActiveStream
+	nextID       atomic.Uint64
+	backlogLimit int
 }
 
 // NewStreamBroker 创建活动流注册表。
 func NewStreamBroker() *StreamBroker {
+	return NewStreamBrokerWithBacklogLimit(defaultStreamBacklogLimit)
+}
+
+func NewStreamBrokerWithBacklogLimit(backlogLimit int) *StreamBroker {
+	if backlogLimit < 1 {
+		backlogLimit = defaultStreamBacklogLimit
+	}
 	return &StreamBroker{
-		streams: make(map[string]*ActiveStream),
+		streams:      make(map[string]*ActiveStream),
+		backlogLimit: backlogLimit,
 	}
 }
 
@@ -49,6 +59,13 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		existing.ModelName = strings.TrimSpace(modelName)
 		existing.Mode = normalizedMode
 		existing.LatestUserText = strings.TrimSpace(latestUserText)
+		existing.Backlog = make([]StreamEvent, 0, 64)
+		existing.BacklogBaseCursor = 0
+		for _, sub := range existing.Subscribers {
+			if sub != nil {
+				sub.Cursor = 0
+			}
+		}
 		if existing.Status == "" {
 			existing.Status = StreamStatusCreated
 		}
@@ -77,7 +94,7 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 			existing.BackgroundShellActions = make(map[string]time.Time)
 		}
 		if existing.PendingCheckpointBlobWrites == nil {
-			existing.PendingCheckpointBlobWrites = make(map[uint32]string)
+			existing.PendingCheckpointBlobWrites = make(map[uint32]pendingCheckpointBlobWrite)
 		}
 		if existing.ConfirmedCheckpointBlobs == nil {
 			existing.ConfirmedCheckpointBlobs = make(map[string]struct{})
@@ -108,7 +125,7 @@ func (broker *StreamBroker) OpenStream(requestID string, conversationID string, 
 		BackgroundShellsByMessageID: make(map[uint32]string),
 		BackgroundShellsByExecID:    make(map[string]string),
 		BackgroundShellActions:      make(map[string]time.Time),
-		PendingCheckpointBlobWrites: make(map[uint32]string),
+		PendingCheckpointBlobWrites: make(map[uint32]pendingCheckpointBlobWrite),
 		ConfirmedCheckpointBlobs:    make(map[string]struct{}),
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
@@ -126,6 +143,39 @@ func (broker *StreamBroker) Get(requestID string) (*ActiveStream, bool) {
 	defer broker.mu.RUnlock()
 	stream, ok := broker.streams[strings.TrimSpace(requestID)]
 	return stream, ok
+}
+
+// SingleActiveStream returns the only non-terminal stream when the client omitted
+// its conversation context. It deliberately refuses ambiguous routing.
+func (broker *StreamBroker) SingleActiveStream() (*ActiveStream, bool) {
+	if broker == nil {
+		return nil, false
+	}
+	broker.mu.RLock()
+	candidates := make([]*ActiveStream, 0, 1)
+	for _, stream := range broker.streams {
+		if stream != nil {
+			candidates = append(candidates, stream)
+		}
+	}
+	broker.mu.RUnlock()
+
+	var active *ActiveStream
+	for _, stream := range candidates {
+		stream.mu.Lock()
+		conversationID := strings.TrimSpace(stream.ConversationID)
+		status := stream.Status
+		phase := stream.Phase
+		stream.mu.Unlock()
+		if conversationID == "" || isTerminalStreamStatus(status) || phase == TurnPhaseCanceled || phase == TurnPhaseCompleted || phase == TurnPhaseFailed {
+			continue
+		}
+		if active != nil {
+			return nil, false
+		}
+		active = stream
+	}
+	return active, active != nil
 }
 
 // Subscribe 为指定 request 注册一个新订阅者，并返回用于唤醒 backlog 消费的信号通道。
@@ -148,6 +198,11 @@ func (broker *StreamBroker) Subscribe(requestID string) (string, <-chan struct{}
 	subscriber := &StreamSubscriber{Signal: make(chan struct{}, subscriberSignalBufferSize)}
 
 	stream.mu.Lock()
+	if isTerminalStreamStatus(stream.Status) {
+		stream.mu.Unlock()
+		return "", nil, nil
+	}
+	subscriber.Cursor = stream.BacklogBaseCursor
 	broker.stopTerminalCleanupTimerLocked(stream)
 	stream.Subscribers[subscriberID] = subscriber
 	stream.UpdatedAt = time.Now().UTC()
@@ -175,12 +230,53 @@ func (broker *StreamBroker) Unsubscribe(requestID string, subscriberID string) i
 	}
 	remaining := 0
 	stream.mu.Lock()
-	if _, ok := stream.Subscribers[strings.TrimSpace(subscriberID)]; ok {
-		delete(stream.Subscribers, strings.TrimSpace(subscriberID))
-	}
+	delete(stream.Subscribers, strings.TrimSpace(subscriberID))
 	remaining = len(stream.Subscribers)
 	stream.mu.Unlock()
 	return remaining
+}
+
+func (broker *StreamBroker) AcknowledgeCursor(requestID string, subscriberID string, cursor int) error {
+	stream, ok := broker.Get(requestID)
+	if !ok || stream == nil {
+		return fmt.Errorf("request is not active: %s", strings.TrimSpace(requestID))
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	subscriber, ok := stream.Subscribers[strings.TrimSpace(subscriberID)]
+	if !ok || subscriber == nil {
+		return fmt.Errorf("subscriber is not active: %s", strings.TrimSpace(subscriberID))
+	}
+	upperBound := stream.BacklogBaseCursor + len(stream.Backlog)
+	if cursor < subscriber.Cursor || cursor > upperBound {
+		return fmt.Errorf("invalid stream cursor: %d", cursor)
+	}
+	subscriber.Cursor = cursor
+	broker.trimAcknowledgedBacklogLocked(stream)
+	return nil
+}
+
+func (broker *StreamBroker) trimAcknowledgedBacklogLocked(stream *ActiveStream) {
+	if stream == nil || len(stream.Subscribers) == 0 || len(stream.Backlog) == 0 {
+		return
+	}
+	acknowledged := stream.BacklogBaseCursor + len(stream.Backlog)
+	for _, subscriber := range stream.Subscribers {
+		if subscriber != nil && subscriber.Cursor < acknowledged {
+			acknowledged = subscriber.Cursor
+		}
+	}
+	trimmed := acknowledged - stream.BacklogBaseCursor
+	if trimmed <= 0 {
+		return
+	}
+	if trimmed > len(stream.Backlog) {
+		trimmed = len(stream.Backlog)
+	}
+	copy(stream.Backlog, stream.Backlog[trimmed:])
+	stream.Backlog = stream.Backlog[:len(stream.Backlog)-trimmed]
+	stream.BacklogBaseCursor += trimmed
+	stream.UpdatedAt = time.Now().UTC()
 }
 
 func (broker *StreamBroker) OtherConversationRequestIDs(conversationID string, keepRequestID string) []string {
@@ -319,6 +415,12 @@ func (broker *StreamBroker) Publish(requestID string, event StreamEvent) error {
 		return nil
 	}
 	stream.Backlog = append(stream.Backlog, event)
+	if len(stream.Subscribers) == 0 && len(stream.Backlog) > broker.backlogLimit {
+		overflow := len(stream.Backlog) - broker.backlogLimit
+		copy(stream.Backlog, stream.Backlog[overflow:])
+		stream.Backlog = stream.Backlog[:broker.backlogLimit]
+		stream.BacklogBaseCursor += overflow
+	}
 	stream.UpdatedAt = time.Now().UTC()
 	subscribers := make([]*StreamSubscriber, 0, len(stream.Subscribers))
 	for _, subscriber := range stream.Subscribers {
@@ -346,13 +448,14 @@ func (broker *StreamBroker) ReadFromCursor(requestID string, cursor int) ([]Stre
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	if cursor < 0 {
-		cursor = 0
+	if cursor < stream.BacklogBaseCursor {
+		cursor = stream.BacklogBaseCursor
 	}
-	if cursor >= len(stream.Backlog) {
+	offset := cursor - stream.BacklogBaseCursor
+	if offset >= len(stream.Backlog) {
 		return nil, nil
 	}
-	return append([]StreamEvent(nil), stream.Backlog[cursor:]...), nil
+	return append([]StreamEvent(nil), stream.Backlog[offset:]...), nil
 }
 
 // Complete 把活动流标记为成功完成，并发布一个成功 endstream 事件。
@@ -391,6 +494,10 @@ func (broker *StreamBroker) Fail(requestID string, terminalCode string, terminal
 		return fmt.Errorf("request is not active: %s", strings.TrimSpace(requestID))
 	}
 	stream.mu.Lock()
+	if isTerminalStreamStatus(stream.Status) {
+		stream.mu.Unlock()
+		return nil
+	}
 	broker.stopTerminalCleanupTimerLocked(stream)
 	stream.Status = StreamStatusFailed
 	subscriberCount := len(stream.Subscribers)
@@ -416,6 +523,10 @@ func (broker *StreamBroker) Cancel(requestID string, terminalMessage string) err
 		return fmt.Errorf("request is not active: %s", strings.TrimSpace(requestID))
 	}
 	stream.mu.Lock()
+	if isTerminalStreamStatus(stream.Status) {
+		stream.mu.Unlock()
+		return nil
+	}
 	broker.stopTerminalCleanupTimerLocked(stream)
 	if stream.ProviderCancel != nil {
 		stream.ProviderCancel()

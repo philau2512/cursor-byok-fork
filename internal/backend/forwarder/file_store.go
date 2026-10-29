@@ -489,11 +489,38 @@ func (store *ConversationFileStore) writeContextLocked(conversationID string, co
 		UpdatedAt:      time.Now().UTC(),
 		Items:          append([]HistoryEntry(nil), conversation.Entries...),
 	}
-	return writeJSONFileAtomic(store.contextPath(conversationID), context)
+	return writeJSONFileAtomicCompact(store.contextPath(conversationID), context)
+}
+
+func conversationTranscriptSyncReady(conversation *ConversationFile) bool {
+	if conversation == nil {
+		return false
+	}
+	switch strings.TrimSpace(conversation.CurrentLoopStatus) {
+	case "running", "waiting_tool", "checkpointing":
+		return conversationHasCompletedTurnBefore(conversation.Entries, conversation.CurrentTurnSeq)
+	default:
+		return true
+	}
+}
+
+func conversationHasCompletedTurnBefore(entries []HistoryEntry, currentTurnSeq int64) bool {
+	if currentTurnSeq <= 0 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.TurnSeq <= 0 || entry.TurnSeq >= currentTurnSeq {
+			continue
+		}
+		if _, ok := cursorTranscriptTurnStatus(entry); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (store *ConversationFileStore) syncCursorTranscriptBestEffort(conversationID string, conversation *ConversationFile) {
-	if store == nil || conversation == nil {
+	if store == nil || conversation == nil || !conversationTranscriptSyncReady(conversation) {
 		return
 	}
 	folder := normalizeAgentTranscriptsFolder(conversation.AgentTranscriptsFolder)
@@ -506,10 +533,6 @@ func (store *ConversationFileStore) syncCursorTranscriptBestEffort(conversationI
 }
 
 func (store *ConversationFileStore) syncCursorTranscript(conversationID string, conversation *ConversationFile, transcriptsFolder string) error {
-	return store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, transcriptsFolder, false)
-}
-
-func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(conversationID string, conversation *ConversationFile, transcriptsFolder string, includeLatestStatus bool) error {
 	if store == nil || conversation == nil {
 		return nil
 	}
@@ -517,7 +540,7 @@ func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(convers
 	if err != nil {
 		return err
 	}
-	data, err := projectCursorTranscriptJSONLWithLatestStatus(conversation, includeLatestStatus)
+	data, err := projectCursorTranscriptJSONLWithLatestStatus(conversation, true)
 	if err != nil {
 		return err
 	}
@@ -526,34 +549,6 @@ func (store *ConversationFileStore) syncCursorTranscriptWithLatestStatus(convers
 	}
 	data = preserveCursorAppendedTurnEnded(path, data)
 	return writeCursorTranscriptAtomic(path, data)
-}
-
-func (store *ConversationFileStore) SyncAllCursorTranscriptsBestEffort() {
-	if store == nil {
-		return
-	}
-	conversationIDs, err := store.ListConversationIDs()
-	if err != nil {
-		log.Printf("forwarder transcript backfill scan failed err=%v", err)
-		return
-	}
-	for _, conversationID := range conversationIDs {
-		conversation, err := store.LoadConversation(conversationID)
-		if err != nil {
-			log.Printf("forwarder transcript backfill load failed conversation_id=%s err=%v", conversationID, err)
-			continue
-		}
-		if conversation == nil || conversation.AgentTranscriptsFolder == "" {
-			continue
-		}
-		info, err := os.Stat(conversation.AgentTranscriptsFolder)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		if err := store.syncCursorTranscriptWithLatestStatus(conversationID, conversation, conversation.AgentTranscriptsFolder, true); err != nil {
-			log.Printf("forwarder transcript backfill failed conversation_id=%s err=%v", conversationID, err)
-		}
-	}
 }
 
 func contextVersionForEntries(entries []HistoryEntry) int64 {
@@ -772,6 +767,7 @@ func mergeConversationMetadata(target *ConversationFile, source *ConversationFil
 	target.CurrentPlanText = source.CurrentPlanText
 	target.CurrentPlans = clonePlanRegistryEntries(source.CurrentPlans)
 	target.CurrentTodos = cloneTodoItems(source.CurrentTodos)
+	target.MCPToolServers = cloneStringMap(source.MCPToolServers)
 	target.ImportedTurnIDs = cloneByteSlices(source.ImportedTurnIDs)
 	target.LatestRequestPrefix = cloneConversationRequestPrefix(source.LatestRequestPrefix)
 	target.LastProviderCall = cloneConversationProviderCall(source.LastProviderCall)
@@ -852,6 +848,14 @@ func validateConversationID(conversationID string) (string, error) {
 }
 
 func writeJSONFileAtomic(path string, payload any) error {
+	return writeJSONFileAtomicWithIndent(path, payload, true)
+}
+
+func writeJSONFileAtomicCompact(path string, payload any) error {
+	return writeJSONFileAtomicWithIndent(path, payload, false)
+}
+
+func writeJSONFileAtomicWithIndent(path string, payload any, indent bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create parent directory: %w", err)
 	}
@@ -859,9 +863,11 @@ func writeJSONFileAtomic(path string, payload any) error {
 	if err != nil {
 		return fmt.Errorf("marshal json: %w", err)
 	}
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, data, "", "  "); err == nil {
-		data = pretty.Bytes()
+	if indent {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, data, "", "  "); err == nil {
+			data = pretty.Bytes()
+		}
 	}
 	file, tempPath, err := openUniqueArtifactTempFile(path)
 	if err != nil {
@@ -905,6 +911,7 @@ func cloneConversationFile(conversation *ConversationFile) *ConversationFile {
 	cloned := *conversation
 	cloned.CurrentPlans = clonePlanRegistryEntries(conversation.CurrentPlans)
 	cloned.CurrentTodos = cloneTodoItems(conversation.CurrentTodos)
+	cloned.MCPToolServers = cloneStringMap(conversation.MCPToolServers)
 	cloned.ImportedTurnIDs = cloneByteSlices(conversation.ImportedTurnIDs)
 	cloned.LatestRequestPrefix = cloneConversationRequestPrefix(conversation.LatestRequestPrefix)
 	cloned.LastProviderCall = cloneConversationProviderCall(conversation.LastProviderCall)

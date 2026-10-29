@@ -2,8 +2,16 @@
 package execbridge
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,8 +39,16 @@ type ExecApplyResult struct {
 	ToolResultPayload string
 	// ToolCall 保存可用于发 ToolCallCompletedUpdate 的工具调用对象；当前仅对支持 ToolCall 的执行型工具可用。
 	ToolCall *agentv1.ToolCall
+	// ContentBlobs 保存需要在提交 history 前写入内容寻址存储的二进制内容。
+	ContentBlobs []ContentBlob
 	// ExecuteHookResponse 保存 execute hook 的结构化响应。
 	ExecuteHookResponse *agentv1.ExecuteHookResponse
+}
+
+// ContentBlob 表示由内容哈希稳定寻址的执行结果二进制数据。
+type ContentBlob struct {
+	ID   []byte
+	Data []byte
 }
 
 // OpenExecContext 表示执行桥打开请求时需要的最小上下文。
@@ -145,6 +161,9 @@ func (bridge *Bridge) ApplyExecClientMessage(msg *agentv1.ExecClientMessage, pen
 		readResult := normalizeReadResultForModel(msg.GetReadResult())
 		result.ToolResultPayload = summarizeReadResult(readResult)
 		result.ToolCall = buildReadCompletedToolCall(pending.ToolCallID, pending.ArgsJSON, readResult)
+		if contentBlob, ok := readImageContentBlob(readResult); ok {
+			result.ContentBlobs = []ContentBlob{contentBlob}
+		}
 		result.IsTerminal = true
 		return result, nil
 	case "write":
@@ -610,12 +629,39 @@ func buildShellOutputNotificationConfig(input *shellOutputNotificationArgs) *age
 	}
 }
 
+// isPythonCommand determines if a shell command invokes Python based on binary name,
+// runner name, or execution of any .py file.
+func isPythonCommand(lower string) bool {
+	if strings.Contains(lower, "python") || strings.Contains(lower, "pytest") || strings.Contains(lower, "uv run") {
+		return true
+	}
+	for field := range strings.FieldsSeq(lower) {
+		clean := strings.Trim(field, `"'`)
+		if strings.HasSuffix(clean, ".py") {
+			return true
+		}
+	}
+	return false
+}
+
+// enrichCommandForStreaming injects environment variables to disable stdout buffering
+// for runtimes like Python and Node on PowerShell when needed.
+func enrichCommandForStreaming(cmd string) string {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
+		return cmd
+	}
+	
+	return trimmed
+}
+
 // openShell 构造 Shell 对应的流式执行桥请求。
 func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.AgentServerMessage, runtimecore.PendingExec, error) {
 	args, err := decodeShellArgs(toolCall.ArgsJSON)
 	if err != nil {
 		return nil, runtimecore.PendingExec{}, fmt.Errorf("decode Shell args failed: %w", err)
 	}
+	command := enrichCommandForStreaming(args.Command)
 	timeout := shellTimeoutFromArgs(args)
 	messageID := bridge.nextID()
 	execID := fmt.Sprintf("exec-shell-%d", time.Now().UnixNano())
@@ -626,12 +672,12 @@ func (bridge *Bridge) openShell(toolCall runtimecore.ToolInvocation) (*agentv1.A
 				ExecId: execID,
 				Message: &agentv1.ExecServerMessage_ShellStreamArgs{
 					ShellStreamArgs: &agentv1.ShellArgs{
-						Command:                  args.Command,
+						Command:                  command,
 						WorkingDirectory:         args.WorkingDirectory,
 						Timeout:                  timeout,
 						ToolCallId:               toolCall.CallID,
-						SimpleCommands:           buildSimpleShellCommands(args.Command),
-						ParsingResult:            buildShellParsingResultProto(args.Command),
+						SimpleCommands:           buildSimpleShellCommands(command),
+						ParsingResult:            buildShellParsingResultProto(command),
 						FileOutputThresholdBytes: uint64Ptr(40000),
 						TimeoutBehavior:          agentv1.TimeoutBehavior_TIMEOUT_BEHAVIOR_BACKGROUND,
 						HardTimeout:              int32Ptr(86400000),
@@ -768,7 +814,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 	}
 	subagentType := strings.TrimSpace(readStringArg(args, "subagent_type", "subagentType"))
 	if subagentType == "" {
-		return nil, runtimecore.PendingExec{}, fmt.Errorf("task subagent_type is required")
+		subagentType = "generalPurpose"
 	}
 	messageID := bridge.nextID()
 	now := time.Now().UTC()
@@ -787,7 +833,7 @@ func (bridge *Bridge) openTask(openContext OpenExecContext, toolCall runtimecore
 			modelID = strings.TrimSpace(openContext.ModelID)
 		}
 	}
-	if modelID == "" {
+	if modelID == "" || modelID == "inherit" || modelID == "default" || modelID == "fast" {
 		modelID = strings.TrimSpace(openContext.ModelID)
 	}
 	serverMessage := &agentv1.AgentServerMessage{
@@ -1784,19 +1830,28 @@ func taskModeFromReadonly(readonly bool) agentv1.TaskMode {
 }
 
 func subagentTypeProtoFromString(raw string) *agentv1.SubagentType {
-	switch strings.TrimSpace(raw) {
-	case "explore":
+	trimmed := strings.TrimSpace(raw)
+	switch strings.ToLower(trimmed) {
+	case "explore", "explorer":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Explore{Explore: &agentv1.SubagentTypeExplore{}}}
-	case "browser-use", "browserUse":
+	case "browser-use", "browseruse":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_BrowserUse{BrowserUse: &agentv1.SubagentTypeBrowserUse{}}}
 	case "shell":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Shell{Shell: &agentv1.SubagentTypeShell{}}}
-	case "":
+	case "bash":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Bash{Bash: &agentv1.SubagentTypeBash{}}}
+	case "debug":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Debug{Debug: &agentv1.SubagentTypeDebug{}}}
+	case "cursor-guide", "cursorguide":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_CursorGuide{CursorGuide: &agentv1.SubagentTypeCursorGuide{}}}
+	case "computer-use", "computeruse":
+		return &agentv1.SubagentType{Type: &agentv1.SubagentType_ComputerUse{ComputerUse: &agentv1.SubagentTypeComputerUse{}}}
+	case "", "generalpurpose", "general_purpose":
 		return &agentv1.SubagentType{Type: &agentv1.SubagentType_Unspecified{Unspecified: &agentv1.SubagentTypeUnspecified{}}}
 	default:
 		return &agentv1.SubagentType{
 			Type: &agentv1.SubagentType_Custom{
-				Custom: &agentv1.SubagentTypeCustom{Name: strings.TrimSpace(raw)},
+				Custom: &agentv1.SubagentTypeCustom{Name: trimmed},
 			},
 		}
 	}
@@ -2098,10 +2153,14 @@ func decodeShellArgsForResult(argsJSON []byte) shellResultArgs {
 	return args
 }
 
-// shellTimeoutFromArgs 把工具 JSON 中的 block_until_ms 映射回 proto timeout。
+func defaultShellTimeout(args shellResultArgs) int32 {
+	return 30000
+}
+
+// shellTimeoutFromArgs maps block_until_ms from tool JSON back to the proto timeout.
 func shellTimeoutFromArgs(args shellResultArgs) int32 {
 	if !args.BlockUntilMSSet {
-		return 30000
+		return defaultShellTimeout(args)
 	}
 	if args.BlockUntilMS <= 0 {
 		return 0
@@ -2285,6 +2344,64 @@ func buildReadMcpResourceCompletedToolCall(argsJSON []byte, result *agentv1.Read
 	}
 }
 
+func supportedReadImageMIMEType(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	detected := strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	configuration, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || configuration.Width <= 0 || configuration.Height <= 0 {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "png":
+		if detected == "image/png" {
+			return detected
+		}
+	case "jpeg":
+		if detected == "image/jpeg" {
+			return detected
+		}
+	case "gif":
+		if detected == "image/gif" {
+			return detected
+		}
+	}
+	return ""
+}
+
+func readImageContentBlob(result *agentv1.ReadResult) (ContentBlob, bool) {
+	success := result.GetSuccess()
+	if success == nil {
+		return ContentBlob{}, false
+	}
+	data := success.GetData()
+	if supportedReadImageMIMEType(data) == "" {
+		return ContentBlob{}, false
+	}
+	digest := sha256.Sum256(data)
+	return ContentBlob{
+		ID:   append([]byte(nil), digest[:]...),
+		Data: append([]byte(nil), data...),
+	}, true
+}
+
+func readImageBlobID(data []byte) ([]byte, bool) {
+	if supportedReadImageMIMEType(data) == "" {
+		return nil, false
+	}
+	digest := sha256.Sum256(data)
+	return append([]byte(nil), digest[:]...), true
+}
+
+func readImageDataBlobOutput(data []byte) *agentv1.ReadToolSuccess_DataBlobId {
+	blobID, ok := readImageBlobID(data)
+	if !ok {
+		return nil
+	}
+	return &agentv1.ReadToolSuccess_DataBlobId{DataBlobId: blobID}
+}
+
 // convertReadResultToReadToolResult 把 `ReadResult` 映射为 `ReadToolResult`。
 func convertReadResultToReadToolResult(result *agentv1.ReadResult) *agentv1.ReadToolResult {
 	if result == nil {
@@ -2318,7 +2435,9 @@ func convertReadResultToReadToolResult(result *agentv1.ReadResult) *agentv1.Read
 		if content != "" {
 			toolSuccess.Output = &agentv1.ReadToolSuccess_Content{Content: content}
 		} else if len(data) > 0 {
-			if len(data) > readReplayBinaryLimit {
+			if imageOutput := readImageDataBlobOutput(data); imageOutput != nil {
+				toolSuccess.Output = imageOutput
+			} else if len(data) > readReplayBinaryLimit {
 				toolSuccess.ExceededLimit = true
 				toolSuccess.Output = &agentv1.ReadToolSuccess_Content{
 					Content: replayTruncationNotice("Read binary data", readReplayBinaryLimit, 0, len(data)),
@@ -2889,10 +3008,19 @@ func DecodeGrepToolArgs(raw []byte, toolCallID string) (*agentv1.GrepArgs, error
 	if err != nil {
 		return nil, err
 	}
+	rawPattern := strings.TrimSpace(readStringArg(args, "pattern"))
+	rawPath := strings.TrimSpace(readStringArg(args, "path"))
+	if rawPath != "" {
+		rawPath = filepath.Clean(rawPath)
+	}
+	rawGlob := strings.TrimSpace(readStringArg(args, "glob"))
+	if rawGlob != "" {
+		rawGlob = strings.ReplaceAll(rawGlob, "\\", "/")
+	}
 	result := &agentv1.GrepArgs{
-		Pattern:    strings.TrimSpace(readStringArg(args, "pattern")),
-		Path:       stringPtr(strings.TrimSpace(readStringArg(args, "path"))),
-		Glob:       stringPtr(strings.TrimSpace(readStringArg(args, "glob"))),
+		Pattern:    rawPattern,
+		Path:       stringPtrIfNonEmpty(rawPath),
+		Glob:       stringPtrIfNonEmpty(rawGlob),
 		OutputMode: stringPtr(strings.TrimSpace(readStringArg(args, "output_mode", "outputMode"))),
 		Type:       stringPtr(strings.TrimSpace(readStringArg(args, "type"))),
 		ToolCallId: strings.TrimSpace(toolCallID),

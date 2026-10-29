@@ -18,6 +18,10 @@ export const modalState = reactive({
  */
 export function showModal(options = {}) {
   return new Promise((resolve) => {
+    const previousResolve = modalState._resolve;
+    modalState._resolve = null;
+    previousResolve?.(false);
+
     modalState.visible = true;
     modalState.title = options.title ?? "提示";
     modalState.content = options.content ?? "";

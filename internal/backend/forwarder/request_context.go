@@ -49,6 +49,21 @@ func normalizeRealtimeRequestContextForStorage(requestContext *agentv1.RequestCo
 	}
 
 	normalized := &agentv1.RequestContext{}
+	if env := requestContext.GetEnv(); env != nil {
+		if clonedEnv, ok := proto.Clone(env).(*agentv1.RequestContextEnv); ok && clonedEnv != nil {
+			normalized.Env = clonedEnv
+		}
+	}
+	if repos := requestContext.GetGitRepos(); len(repos) > 0 {
+		normalized.GitRepos = make([]*agentv1.GitRepoInfo, 0, len(repos))
+		for _, repo := range repos {
+			if repo != nil {
+				if clonedRepo, ok := proto.Clone(repo).(*agentv1.GitRepoInfo); ok && clonedRepo != nil {
+					normalized.GitRepos = append(normalized.GitRepos, clonedRepo)
+				}
+			}
+		}
+	}
 	normalized.Rules = guardCursorRules(filterNonSkillRules(requestContext.GetRules()))
 	if fileContents := normalizeRealtimeFileContents(requestContext.GetFileContents()); len(fileContents) > 0 {
 		normalized.FileContents = fileContents
@@ -65,7 +80,7 @@ func normalizeRealtimeRequestContextForStorage(requestContext *agentv1.RequestCo
 	if pr := strings.TrimSpace(requestContext.GetPrAttributionMessage()); pr != "" {
 		normalized.PrAttributionMessage = stringPtr(truncatePromptGuardText("request_context.pr_attribution_message", pr, promptGuardRealtimeTextChars))
 	}
-	if !hasRealtimeRequestContextContent(normalized) {
+	if !hasRealtimeRequestContextContent(normalized) && normalized.Env == nil && len(normalized.GitRepos) == 0 {
 		return nil
 	}
 	return normalized
@@ -318,15 +333,21 @@ func collectMCPToolServers(requestContext *agentv1.RequestContext) map[string]st
 	}
 
 	servers := make(map[string]string)
+	serverAliases := make(map[string]string)
 	addDescriptors := func(descriptors []*agentv1.McpDescriptor) {
 		for _, descriptor := range descriptors {
 			if descriptor == nil {
 				continue
 			}
-			serverIdentifier := firstNonEmpty(descriptor.GetServerIdentifier(), descriptor.GetServerName())
-			if strings.TrimSpace(serverIdentifier) == "" {
+			serverIdentifier := strings.TrimSpace(firstNonEmpty(descriptor.GetServerIdentifier(), descriptor.GetServerName()))
+			serverName := strings.TrimSpace(descriptor.GetServerName())
+			if serverIdentifier == "" {
 				continue
 			}
+			if serverName != "" {
+				serverAliases[serverName] = serverIdentifier
+			}
+			serverAliases[serverIdentifier] = serverIdentifier
 			for _, tool := range descriptor.GetTools() {
 				if tool == nil {
 					continue
@@ -335,16 +356,20 @@ func collectMCPToolServers(requestContext *agentv1.RequestContext) map[string]st
 				if toolName == "" {
 					continue
 				}
-				if _, exists := servers[toolName]; exists {
-					continue
+				servers[toolName] = serverIdentifier
+				if serverName != "" {
+					servers[forwarderCanonicalMCPToolLookupName(serverName, toolName)] = serverIdentifier
 				}
-				servers[toolName] = strings.TrimSpace(serverIdentifier)
+				servers[forwarderCanonicalMCPToolLookupName(serverIdentifier, toolName)] = serverIdentifier
 			}
 		}
 	}
 
 	addDescriptors(requestContext.GetMcpFileSystemOptions().GetMcpDescriptors())
 	addDescriptors(requestContext.GetMcpMetaToolOptions().GetMcpDescriptors())
+	for alias, identifier := range serverAliases {
+		servers[alias] = identifier
+	}
 	if len(servers) == 0 {
 		return nil
 	}
