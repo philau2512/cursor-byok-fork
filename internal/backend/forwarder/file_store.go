@@ -2,10 +2,12 @@
 package forwarder
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -22,6 +24,8 @@ import (
 const (
 	conversationStateFileName          = "state.json"
 	conversationContextFileName        = "context.json"
+	conversationContextJSONLFileName   = "context.jsonl"
+	maxCachedConversations             = 8
 	conversationSchemaVersion          = 1
 	conversationLockStaleAfter         = 30 * time.Minute
 	legacyConversationLockStaleAfter   = 30 * time.Second
@@ -41,8 +45,16 @@ type conversationProcessLock struct {
 	refs int
 }
 
+type cachedConversationEntries struct {
+	contextVersion int64
+	entries        []HistoryEntry
+	cachedAt       time.Time
+}
+
 type ConversationFileStore struct {
-	root string
+	root         string
+	cacheMu      sync.RWMutex
+	entriesCache map[string]cachedConversationEntries
 }
 
 type conversationContextFile struct {
@@ -55,7 +67,55 @@ type conversationContextFile struct {
 
 // NewConversationFileStore 创建 JSON history 文件存储。
 func NewConversationFileStore(historyRoot string) *ConversationFileStore {
-	return &ConversationFileStore{root: strings.TrimSpace(historyRoot)}
+	return &ConversationFileStore{
+		root:         strings.TrimSpace(historyRoot),
+		entriesCache: make(map[string]cachedConversationEntries),
+	}
+}
+
+func (store *ConversationFileStore) updateCacheLocked(conversationID string, contextVersion int64, entries []HistoryEntry) {
+	if store == nil {
+		return
+	}
+	store.cacheMu.Lock()
+	defer store.cacheMu.Unlock()
+	if store.entriesCache == nil {
+		store.entriesCache = make(map[string]cachedConversationEntries)
+	}
+	if len(store.entriesCache) >= maxCachedConversations {
+		var oldestID string
+		var oldestTime time.Time
+		for id, item := range store.entriesCache {
+			if oldestID == "" || item.cachedAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = item.cachedAt
+			}
+		}
+		if oldestID != "" && oldestID != conversationID {
+			delete(store.entriesCache, oldestID)
+		}
+	}
+	store.entriesCache[conversationID] = cachedConversationEntries{
+		contextVersion: contextVersion,
+		entries:        append([]HistoryEntry(nil), entries...),
+		cachedAt:       time.Now(),
+	}
+}
+
+func (store *ConversationFileStore) getCachedEntries(conversationID string, expectedContextVersion int64) ([]HistoryEntry, bool) {
+	if store == nil || expectedContextVersion <= 0 {
+		return nil, false
+	}
+	store.cacheMu.RLock()
+	defer store.cacheMu.RUnlock()
+	if store.entriesCache == nil {
+		return nil, false
+	}
+	cached, ok := store.entriesCache[conversationID]
+	if !ok || cached.contextVersion != expectedContextVersion {
+		return nil, false
+	}
+	return append([]HistoryEntry(nil), cached.entries...), true
 }
 
 // HistoryDir 返回 history 根路径。
@@ -173,7 +233,7 @@ func (store *ConversationFileStore) AppendEntriesWithUpdate(conversationID strin
 		}
 	}
 	deriveConversationLoopState(conversation)
-	if err := store.writeConversationLocked(normalizedConversationID, conversation); err != nil {
+	if err := store.appendConversationEntriesLocked(normalizedConversationID, conversation, assigned); err != nil {
 		return nil, nil, err
 	}
 	return cloneConversationFile(conversation), assigned, nil
@@ -417,7 +477,7 @@ func (store *ConversationFileStore) readConversationLocked(conversationID string
 	if err := json.Unmarshal(stateBody, &conversation); err != nil {
 		return nil, fmt.Errorf("decode conversation state %q: %w", conversationID, err)
 	}
-	context, err := store.readContextLocked(conversationID)
+	context, err := store.readContextLocked(conversationID, conversation.ContextVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -426,19 +486,69 @@ func (store *ConversationFileStore) readConversationLocked(conversationID string
 	return &conversation, nil
 }
 
-func (store *ConversationFileStore) readContextLocked(conversationID string) ([]HistoryEntry, error) {
-	body, err := os.ReadFile(store.contextPath(conversationID))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return make([]HistoryEntry, 0, 16), nil
+func (store *ConversationFileStore) readContextLocked(conversationID string, expectedContextVersion int64) ([]HistoryEntry, error) {
+	if entries, hit := store.getCachedEntries(conversationID, expectedContextVersion); hit {
+		return entries, nil
+	}
+
+	jsonlPath := store.contextJSONLPath(conversationID)
+	if ok, _ := fileExists(jsonlPath); ok {
+		entries, err := readContextJSONL(jsonlPath)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("read conversation context: %w", err)
+		version := expectedContextVersion
+		if version <= 0 {
+			version = contextVersionForEntries(entries)
+		}
+		store.updateCacheLocked(conversationID, version, entries)
+		return entries, nil
 	}
-	var context conversationContextFile
-	if err := json.Unmarshal(body, &context); err != nil {
-		return nil, fmt.Errorf("decode conversation context %q: %w", conversationID, err)
+
+	legacyPath := store.contextPath(conversationID)
+	if ok, _ := fileExists(legacyPath); ok {
+		entries, err := readContextLegacyJSON(legacyPath)
+		if err != nil {
+			return nil, err
+		}
+		version := expectedContextVersion
+		if version <= 0 {
+			version = contextVersionForEntries(entries)
+		}
+		store.updateCacheLocked(conversationID, version, entries)
+		return entries, nil
 	}
-	return append([]HistoryEntry(nil), context.Items...), nil
+
+	return make([]HistoryEntry, 0, 16), nil
+}
+
+func (store *ConversationFileStore) appendConversationEntriesLocked(conversationID string, conversation *ConversationFile, assigned []HistoryEntry) error {
+	if conversation == nil {
+		return fmt.Errorf("conversation is nil")
+	}
+	normalizeLoadedConversation(conversationID, conversation)
+
+	jsonlPath := store.contextJSONLPath(conversationID)
+	jsonlExists, _ := fileExists(jsonlPath)
+
+	if jsonlExists && len(assigned) > 0 {
+		if err := appendContextJSONL(jsonlPath, assigned); err != nil {
+			return err
+		}
+		_ = os.Remove(store.contextPath(conversationID))
+	} else if !jsonlExists {
+		if err := writeContextJSONLAtomic(jsonlPath, conversation.Entries); err != nil {
+			return err
+		}
+		_ = os.Remove(store.contextPath(conversationID))
+	}
+
+	store.updateCacheLocked(conversationID, conversation.ContextVersion, conversation.Entries)
+	if err := store.writeConversationMetaLocked(conversationID, conversation); err != nil {
+		return err
+	}
+	store.syncCursorTranscriptBestEffort(conversationID, conversation)
+	return nil
 }
 
 func (store *ConversationFileStore) writeConversationLocked(conversationID string, conversation *ConversationFile) error {
@@ -449,6 +559,7 @@ func (store *ConversationFileStore) writeConversationLocked(conversationID strin
 	if err := store.writeContextLocked(conversationID, conversation); err != nil {
 		return err
 	}
+	store.updateCacheLocked(conversationID, conversation.ContextVersion, conversation.Entries)
 	if err := store.writeConversationMetaLocked(conversationID, conversation); err != nil {
 		return err
 	}
@@ -482,14 +593,145 @@ func (store *ConversationFileStore) writeConversationMetaLocked(conversationID s
 }
 
 func (store *ConversationFileStore) writeContextLocked(conversationID string, conversation *ConversationFile) error {
-	context := conversationContextFile{
-		SchemaVersion:  conversationSchemaVersion,
-		ConversationID: strings.TrimSpace(conversationID),
-		Version:        contextVersionForEntries(conversation.Entries),
-		UpdatedAt:      time.Now().UTC(),
-		Items:          append([]HistoryEntry(nil), conversation.Entries...),
+	jsonlPath := store.contextJSONLPath(conversationID)
+	if err := writeContextJSONLAtomic(jsonlPath, conversation.Entries); err != nil {
+		return err
 	}
-	return writeJSONFileAtomicCompact(store.contextPath(conversationID), context)
+	_ = os.Remove(store.contextPath(conversationID))
+	return nil
+}
+
+func readContextJSONL(path string) ([]HistoryEntry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return make([]HistoryEntry, 0, 16), nil
+		}
+		return nil, fmt.Errorf("open conversation context jsonl: %w", err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReaderSize(file, 256*1024)
+	entries := make([]HistoryEntry, 0, 32)
+	lineNum := 0
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			lineNum++
+			var entry HistoryEntry
+			if jsonErr := json.Unmarshal(trimmed, &entry); jsonErr != nil {
+				// Torn-write safety: if at EOF or reading has finished, drop incomplete trailing line
+				if readErr != nil && (errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF)) {
+					break
+				}
+				if _, peekErr := reader.Peek(1); peekErr != nil {
+					break
+				}
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return entries, fmt.Errorf("read conversation context jsonl at line %d: %w", lineNum, readErr)
+		}
+	}
+	return entries, nil
+}
+
+func readContextLegacyJSON(path string) ([]HistoryEntry, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return make([]HistoryEntry, 0, 16), nil
+		}
+		return nil, fmt.Errorf("read conversation legacy context: %w", err)
+	}
+	var context conversationContextFile
+	if err := json.Unmarshal(body, &context); err != nil {
+		return nil, fmt.Errorf("decode conversation legacy context: %w", err)
+	}
+	return append([]HistoryEntry(nil), context.Items...), nil
+}
+
+func writeContextJSONLAtomic(path string, entries []HistoryEntry) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
+	file, tempPath, err := openUniqueArtifactTempFile(path)
+	if err != nil {
+		return fmt.Errorf("open temp file: %w", err)
+	}
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	writer := bufio.NewWriterSize(file, 256*1024)
+	for _, entry := range entries {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			_ = file.Close()
+			return fmt.Errorf("marshal entry: %w", err)
+		}
+		if _, err := writer.Write(data); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("write entry json: %w", err)
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("write newline: %w", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("flush temp file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := renameArtifactTempFile(tempPath, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	renamed = true
+	return syncDirectory(filepath.Dir(path))
+}
+
+func appendContextJSONL(path string, entries []HistoryEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open append context jsonl: %w", err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriterSize(file, 64*1024)
+	for _, entry := range entries {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Errorf("marshal entry: %w", err)
+		}
+		if _, err := writer.Write(data); err != nil {
+			return fmt.Errorf("write entry json: %w", err)
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			return fmt.Errorf("write newline: %w", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush append context jsonl: %w", err)
+	}
+	return file.Sync()
 }
 
 func conversationTranscriptSyncReady(conversation *ConversationFile) bool {
@@ -683,6 +925,10 @@ func (store *ConversationFileStore) statePath(conversationID string) string {
 
 func (store *ConversationFileStore) contextPath(conversationID string) string {
 	return filepath.Join(store.conversationDir(conversationID), conversationContextFileName)
+}
+
+func (store *ConversationFileStore) contextJSONLPath(conversationID string) string {
+	return filepath.Join(store.conversationDir(conversationID), conversationContextJSONLFileName)
 }
 
 func (store *ConversationFileStore) lockPath(conversationID string) string {
