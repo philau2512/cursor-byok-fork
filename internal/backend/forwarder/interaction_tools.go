@@ -207,12 +207,9 @@ func isInteractionTool(name string) bool {
 }
 
 func shouldAutoResumeAfterInteraction(pending runtimecore.PendingInteraction) bool {
-	switch strings.TrimSpace(pending.InteractionKind) {
-	case "create_plan":
-		return false
-	default:
-		return true
-	}
+	// Tự động tiếp tục vòng lặp model sau khi tạo plan thành công,
+	// giúp AI tự động thực thi các bước tiếp theo mà không bị ngắt stream chờ click thủ công.
+	return true
 }
 
 type generateImageToolCarrier struct {

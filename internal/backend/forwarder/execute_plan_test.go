@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 )
 
 func TestExtractConversationActionUserMessage_ExecutePlanAction(t *testing.T) {
@@ -138,6 +139,15 @@ func TestFilterUnprocessedUserMessages(t *testing.T) {
 	_, _, allExistWork := filterUnprocessedUserMessages(intent, conv)
 	if allExistWork {
 		t.Fatal("expected allExistWork to be false when all messages exist in history")
+	}
+}
+
+func TestShouldAutoResumeAfterCreatePlanInteraction(t *testing.T) {
+	pending := runtimecore.PendingInteraction{
+		InteractionKind: "create_plan",
+	}
+	if !shouldAutoResumeAfterInteraction(pending) {
+		t.Fatal("expected shouldAutoResumeAfterInteraction to return true for create_plan so AI continues automatically")
 	}
 }
 
