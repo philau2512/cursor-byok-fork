@@ -221,6 +221,9 @@ func (engine *Engine) Compile(input CompileInput) (CompiledPrompt, error) {
 
 	messages = append(messages, buildMessagesFromCommittedTurns(input.ConversationState)...)
 	messages = append(messages, buildMessagesFromStructuredState(input.ConversationState)...)
+	if strings.TrimSpace(input.CurrentUserMessageText) != "" {
+		InvalidateAgentRulesCache()
+	}
 	messages = append(messages, buildMessagesFromRequestContext(input.RequestContext)...)
 
 	if text := strings.TrimSpace(input.CurrentUserMessageText); text != "" {
@@ -316,6 +319,7 @@ func buildMessagesFromRequestContext(requestContext *agentv1.RequestContext) []M
 
 	mergeLocalSkills(requestContext)
 	mergeLocalSubagents(requestContext)
+	mergeLocalAgentRules(requestContext)
 	hydrateLocalMCPDescriptors(requestContext)
 
 	sections := append(buildRequestContextStaticSections(requestContext), buildRequestContextRealtimeSections(requestContext)...)

@@ -272,4 +272,262 @@ func TestHydrateLocalMCPDescriptorsFullDescription(t *testing.T) {
 	}
 }
 
+func TestMergeLocalAgentRulesMultiLevel(t *testing.T) {
+	tempDir := t.TempDir()
 
+	// 1. Root AGENTS.md
+	rootRulePath := filepath.Join(tempDir, "AGENTS.md")
+	if err := os.WriteFile(rootRulePath, []byte("Root project instructions: Always follow TDD."), 0644); err != nil {
+		t.Fatalf("write root AGENTS.md: %v", err)
+	}
+
+	// 2. Nested level 2: packages/auth/AGENTS.md with frontmatter
+	authDir := filepath.Join(tempDir, "packages", "auth")
+	if err := os.MkdirAll(authDir, 0755); err != nil {
+		t.Fatalf("mkdir authDir: %v", err)
+	}
+	authRulePath := filepath.Join(authDir, "AGENTS.md")
+	authContent := "---\ndescription: Auth module rules\n---\nAuth instructions: Use RS256 for JWT tokens."
+	if err := os.WriteFile(authRulePath, []byte(authContent), 0644); err != nil {
+		t.Fatalf("write auth AGENTS.md: %v", err)
+	}
+
+	// 3. Nested level 4: services/core/handler/v1/agent.md (case-insensitive)
+	handlerDir := filepath.Join(tempDir, "services", "core", "handler", "v1")
+	if err := os.MkdirAll(handlerDir, 0755); err != nil {
+		t.Fatalf("mkdir handlerDir: %v", err)
+	}
+	handlerRulePath := filepath.Join(handlerDir, "agent.md")
+	if err := os.WriteFile(handlerRulePath, []byte("Handler instructions: Validate all request inputs."), 0644); err != nil {
+		t.Fatalf("write handler agent.md: %v", err)
+	}
+
+	// 4. Ignored directories: node_modules and .git
+	nodeModulesDir := filepath.Join(tempDir, "node_modules", "somepkg")
+	if err := os.MkdirAll(nodeModulesDir, 0755); err != nil {
+		t.Fatalf("mkdir nodeModulesDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeModulesDir, "AGENTS.md"), []byte("Should be ignored"), 0644); err != nil {
+		t.Fatalf("write node_modules AGENTS.md: %v", err)
+	}
+
+	gitDir := filepath.Join(tempDir, ".git", "hooks")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatalf("mkdir gitDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "AGENTS.md"), []byte("Should be ignored"), 0644); err != nil {
+		t.Fatalf("write .git AGENTS.md: %v", err)
+	}
+
+	// 5. Exceeds max depth (> 5): a/b/c/d/e/f/AGENTS.md
+	deepDir := filepath.Join(tempDir, "l1", "l2", "l3", "l4", "l5", "l6")
+	if err := os.MkdirAll(deepDir, 0755); err != nil {
+		t.Fatalf("mkdir deepDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deepDir, "AGENTS.md"), []byte("Should be skipped due to depth"), 0644); err != nil {
+		t.Fatalf("write deep AGENTS.md: %v", err)
+	}
+
+	compiled, err := NewEngine().Compile(CompileInput{
+		Mode: agentv1.AgentMode_AGENT_MODE_AGENT,
+		RequestContext: &agentv1.RequestContext{
+			Env: &agentv1.RequestContextEnv{
+				WorkspacePaths: []string{tempDir},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	joined := make([]string, 0, len(compiled.Messages))
+	for _, message := range compiled.Messages {
+		joined = append(joined, message.Content)
+	}
+	prompt := strings.Join(joined, "\n")
+
+	// Verify rules section presence
+	if !strings.Contains(prompt, "<rules>") || !strings.Contains(prompt, "<user_rules") {
+		t.Fatal("compiled prompt missing <rules> or <user_rules>")
+	}
+
+	// Verify root AGENTS.md
+	if !strings.Contains(prompt, "# Project Rule: AGENTS.md (Root Workspace)") {
+		t.Fatal("compiled prompt missing Root Workspace header")
+	}
+	if !strings.Contains(prompt, "Root project instructions: Always follow TDD.") {
+		t.Fatal("compiled prompt missing root rule content")
+	}
+
+	// Verify packages/auth/AGENTS.md scope and content (frontmatter stripped)
+	if !strings.Contains(prompt, "# Project Rule: packages/auth/AGENTS.md (Scope: packages/auth/)") {
+		t.Fatal("compiled prompt missing packages/auth scope header")
+	}
+	if !strings.Contains(prompt, "Auth instructions: Use RS256 for JWT tokens.") {
+		t.Fatal("compiled prompt missing auth rule content")
+	}
+	if strings.Contains(prompt, "description: Auth module rules") {
+		t.Fatal("compiled prompt should strip frontmatter yaml block")
+	}
+
+	// Verify services/core/handler/v1/agent.md scope and content
+	if !strings.Contains(prompt, "# Project Rule: services/core/handler/v1/agent.md (Scope: services/core/handler/v1/)") {
+		t.Fatal("compiled prompt missing services/core/handler/v1 scope header")
+	}
+	if !strings.Contains(prompt, "Handler instructions: Validate all request inputs.") {
+		t.Fatal("compiled prompt missing handler rule content")
+	}
+
+	// Verify ignored directories are not loaded
+	if strings.Contains(prompt, "Should be ignored") {
+		t.Fatal("compiled prompt included ignored directory AGENTS.md")
+	}
+
+	// Verify deep directory > 5 is skipped
+	if strings.Contains(prompt, "Should be skipped due to depth") {
+		t.Fatal("compiled prompt included rule exceeding max scan depth")
+	}
+
+	// Verify ordering: root should appear before packages/auth, and packages/auth before services/core/handler
+	rootIdx := strings.Index(prompt, "# Project Rule: AGENTS.md (Root Workspace)")
+	authIdx := strings.Index(prompt, "# Project Rule: packages/auth/AGENTS.md (Scope: packages/auth/)")
+	handlerIdx := strings.Index(prompt, "# Project Rule: services/core/handler/v1/agent.md (Scope: services/core/handler/v1/)")
+
+	if rootIdx > authIdx || authIdx > handlerIdx {
+		t.Fatalf("rules ordering incorrect: rootIdx=%d, authIdx=%d, handlerIdx=%d", rootIdx, authIdx, handlerIdx)
+	}
+}
+
+func TestMergeLocalAgentRulesIgnoresCursorInternalProjectFolderAndHome(t *testing.T) {
+	tempWorkspace := t.TempDir()
+	workspaceRulePath := filepath.Join(tempWorkspace, "AGENTS.md")
+	if err := os.WriteFile(workspaceRulePath, []byte("Workspace rule: valid"), 0644); err != nil {
+		t.Fatalf("write workspace rule: %v", err)
+	}
+
+	tempHome := t.TempDir()
+	fakeCursorProjectFolder := filepath.Join(tempHome, ".cursor", "projects", "d-Admin-Documents-PROJECTS-test")
+	if err := os.MkdirAll(fakeCursorProjectFolder, 0755); err != nil {
+		t.Fatalf("mkdir fakeCursorProjectFolder: %v", err)
+	}
+
+	// Home should not be scanned
+	homeRulePath := filepath.Join(tempHome, "AGENTS.md")
+	if err := os.WriteFile(homeRulePath, []byte("Home rule: should be ignored"), 0644); err != nil {
+		t.Fatalf("write home rule: %v", err)
+	}
+
+	// AppData inside home should definitely not be scanned
+	appDataDir := filepath.Join(tempHome, "AppData", "Local", "firefox-manager")
+	if err := os.MkdirAll(appDataDir, 0755); err != nil {
+		t.Fatalf("mkdir appdata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(appDataDir, "AGENTS.md"), []byte("AppData rule: should be ignored"), 0644); err != nil {
+		t.Fatalf("write appdata rule: %v", err)
+	}
+
+	compiled, err := NewEngine().Compile(CompileInput{
+		Mode: agentv1.AgentMode_AGENT_MODE_AGENT,
+		RequestContext: &agentv1.RequestContext{
+			Env: &agentv1.RequestContextEnv{
+				WorkspacePaths: []string{tempWorkspace},
+				ProjectFolder:  fakeCursorProjectFolder,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	joined := make([]string, 0, len(compiled.Messages))
+	for _, message := range compiled.Messages {
+		joined = append(joined, message.Content)
+	}
+	prompt := strings.Join(joined, "\n")
+
+	if !strings.Contains(prompt, "Workspace rule: valid") {
+		t.Fatal("expected workspace rule to be included")
+	}
+	if strings.Contains(prompt, "Home rule: should be ignored") {
+		t.Fatal("home rule should not be included")
+	}
+	if strings.Contains(prompt, "AppData rule: should be ignored") {
+		t.Fatal("AppData rule should not be included")
+	}
+}
+
+func TestMergeLocalAgentRulesCacheOnlyOnNewUserMessage(t *testing.T) {
+	tempWorkspace := t.TempDir()
+	workspaceRulePath := filepath.Join(tempWorkspace, "AGENTS.md")
+	if err := os.WriteFile(workspaceRulePath, []byte("Version 1 rule"), 0644); err != nil {
+		t.Fatalf("write workspace rule: %v", err)
+	}
+
+	engine := NewEngine()
+
+	// 1. First call with new user message: scans disk and caches Version 1
+	compiled1, err := engine.Compile(CompileInput{
+		Mode:                   agentv1.AgentMode_AGENT_MODE_AGENT,
+		CurrentUserMessageText: "Hello agent",
+		RequestContext: &agentv1.RequestContext{
+			Env: &agentv1.RequestContextEnv{
+				WorkspacePaths: []string{tempWorkspace},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile 1: %v", err)
+	}
+	if !strings.Contains(compiled1.Messages[len(compiled1.Messages)-2].Content, "Version 1 rule") {
+		t.Fatal("expected Version 1 rule in compile 1")
+	}
+
+	// 2. Modify rule on disk mid-turn (simulating changes while tool calls are running)
+	if err := os.WriteFile(workspaceRulePath, []byte("Version 2 rule"), 0644); err != nil {
+		t.Fatalf("update workspace rule: %v", err)
+	}
+
+	// 3. Second call during tool call (CurrentUserMessageText is empty): should use cache, NOT re-scan
+	compiled2, err := engine.Compile(CompileInput{
+		Mode: agentv1.AgentMode_AGENT_MODE_AGENT,
+		RequestContext: &agentv1.RequestContext{
+			Env: &agentv1.RequestContextEnv{
+				WorkspacePaths: []string{tempWorkspace},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile 2: %v", err)
+	}
+	var c2Text string
+	for _, m := range compiled2.Messages {
+		c2Text += m.Content + "\n"
+	}
+	if strings.Contains(c2Text, "Version 2 rule") {
+		t.Fatal("tool call step should have used cached rules and not re-scanned disk")
+	}
+	if !strings.Contains(c2Text, "Version 1 rule") {
+		t.Fatal("tool call step should still contain cached Version 1 rule")
+	}
+
+	// 4. Third call when user sends a new message: cache is invalidated, picks up Version 2
+	compiled3, err := engine.Compile(CompileInput{
+		Mode:                   agentv1.AgentMode_AGENT_MODE_AGENT,
+		CurrentUserMessageText: "Next user turn",
+		RequestContext: &agentv1.RequestContext{
+			Env: &agentv1.RequestContextEnv{
+				WorkspacePaths: []string{tempWorkspace},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile 3: %v", err)
+	}
+	var c3Text string
+	for _, m := range compiled3.Messages {
+		c3Text += m.Content + "\n"
+	}
+	if !strings.Contains(c3Text, "Version 2 rule") {
+		t.Fatal("new user message should invalidate cache and pick up Version 2 rule")
+	}
+}
