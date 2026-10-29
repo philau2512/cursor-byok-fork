@@ -320,13 +320,13 @@ func TestShellForegroundRecoveryCompletesAfterDeadline(t *testing.T) {
 		t.Fatalf("foreground recovery error = %v", err)
 	}
 	if _, found := snapshotPendingExec(stream, pending.ExecID); found {
-		t.Fatal("foreground recovery left shell pending")
+		t.Fatal("foreground recovery left the shell pending")
 	}
 	if completions := shellCompletionCount(stream, pending.ToolCallID); completions != 1 {
 		t.Fatalf("completion count = %d, want 1", completions)
 	}
 	if !shellHistoryContains(stream, "The foreground wait window expired after 30000ms") {
-		t.Fatal("foreground recovery did not persist timeout result")
+		t.Fatal("foreground recovery result did not retain timeout reason")
 	}
 }
 
@@ -447,7 +447,11 @@ func testShellRecoveryFixture(t *testing.T, state string) (*Service, *ActiveStre
 		projector:  NewHistoryProjector(),
 		execBridge: execbridge.NewBridge(),
 	}
-	if err := service.replaceCheckpointConversation(stream, testConversation(nil)); err != nil {
+	if err := service.replaceCheckpointConversation(stream, &ConversationFile{
+		ConversationID:     stream.ConversationID,
+		RootConversationID: stream.ConversationID,
+		Mode:               "agent",
+	}); err != nil {
 		t.Fatalf("replaceCheckpointConversation() error = %v", err)
 	}
 	pending := initializePendingExecForTracking(runtimecore.PendingExec{
