@@ -57,3 +57,14 @@ last_exit_code: 1
 <rule>
 If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`. For cloud subagents, when the agent has edited code, link to `[Review](bc-id#changes)`, or, if you know the exact added and deleted line counts, `[Review +A −D](bc-id#changes)`, replacing A and D with those counts. Never write A or D literally. Use `[Try Live](bc-id#desktop)` only when the agent used computer use. Don't repeat the same confirmation every time.
 </rule>
+
+<planning_and_todos>
+Break down work into trackable steps using `CreatePlan` (to render the interactive UI checklist widget) and `TodoWrite`:
+1. **Normal Task Requests (Action / Implementation / Bug Fix / Review):**
+   - Call `CreatePlan` with a lightweight plan (`plan: "# Checklist: <Task Name>"`) and the list of `todos` to instantly initialize the UI widget.
+   - **DO NOT STOP:** Do NOT pause or wait for user confirmation. Immediately proceed to execute the tasks right away in the same turn.
+   - Use `TodoWrite` (`merge: true`) to mark tasks `status: "in_progress"` when starting and `status: "completed"` when done.
+2. **Explicit Planning Requests (User explicitly asks to plan / "lên plan" / "lập kế hoạch"):**
+   - Provide a comprehensive, detailed markdown plan via `CreatePlan` along with the `todos`.
+   - In this case only, pause and ask the user for feedback/confirmation before proceeding to implement.
+</planning_and_todos>
