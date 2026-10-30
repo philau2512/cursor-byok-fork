@@ -208,7 +208,17 @@ func TestHydrateLocalMCPDescriptorsFullDescription(t *testing.T) {
 	toolDefPath := filepath.Join(tempDir, "InspectChanges.json")
 	toolJSON := `{
 		"name": "InspectChanges",
-		"description": "Inspects uncommitted Git changes (status and diff) with structured summaries."
+		"description": "Inspects uncommitted Git changes (status and diff) with structured summaries.",
+		"arguments": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "Path to inspect"
+				}
+			},
+			"required": ["path"]
+		}
 	}`
 	if err := os.WriteFile(toolDefPath, []byte(toolJSON), 0644); err != nil {
 		t.Fatalf("write tool json: %v", err)
@@ -264,11 +274,72 @@ func TestHydrateLocalMCPDescriptorsFullDescription(t *testing.T) {
 	if !strings.Contains(prompt, "<description>Inspects uncommitted Git changes (status and diff) with structured summaries.</description>") {
 		t.Fatal("compiled prompt missing hydrated full description for InspectChanges")
 	}
+	if !strings.Contains(prompt, `<input_schema>{&quot;properties&quot;:{&quot;path&quot;:{&quot;description&quot;:&quot;Path to inspect&quot;,&quot;type&quot;:&quot;string&quot;}},&quot;required&quot;:[&quot;path&quot;],&quot;type&quot;:&quot;object&quot;}</input_schema>`) {
+		t.Fatal("compiled prompt missing hydrated input_schema for InspectChanges")
+	}
 	if !strings.Contains(prompt, `<mcp_tool name="fast_context_search">`) {
 		t.Fatal("compiled prompt missing fast_context_search tool")
 	}
 	if !strings.Contains(prompt, "Fast semantic codebase search and context discovery") {
 		t.Fatal("compiled prompt missing fallback description for fast_context_search in mcp_file_system")
+	}
+}
+
+func TestHydrateLocalMCPDescriptorsPreexistingDescriptionWithMissingSchema(t *testing.T) {
+	tempDir := t.TempDir()
+	toolDefPath := filepath.Join(tempDir, "query.json")
+	toolJSON := `{
+		"name": "query",
+		"description": "File description",
+		"arguments": {
+			"type": "object",
+			"properties": {
+				"sql": {
+					"type": "string"
+				}
+			}
+		}
+	}`
+	if err := os.WriteFile(toolDefPath, []byte(toolJSON), 0644); err != nil {
+		t.Fatalf("write tool json: %v", err)
+	}
+
+	compiled, err := NewEngine().Compile(CompileInput{
+		Mode: agentv1.AgentMode_AGENT_MODE_AGENT,
+		RequestContext: &agentv1.RequestContext{
+			McpMetaToolOptions: &agentv1.McpMetaToolOptions{
+				Enabled: true,
+				McpDescriptors: []*agentv1.McpDescriptor{
+					{
+						ServerIdentifier: "user-gridex",
+						ServerName:       "gridex",
+						Tools: []*agentv1.McpToolDescriptor{
+							{
+								ToolName:       "query",
+								Description:    proto.String("Pre-existing client description"),
+								DefinitionPath: proto.String(toolDefPath),
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	joined := make([]string, 0, len(compiled.Messages))
+	for _, message := range compiled.Messages {
+		joined = append(joined, message.Content)
+	}
+	prompt := strings.Join(joined, "\n")
+
+	if !strings.Contains(prompt, "<description>Pre-existing client description</description>") {
+		t.Fatal("compiled prompt should preserve pre-existing client description")
+	}
+	if !strings.Contains(prompt, `<input_schema>{&quot;properties&quot;:{&quot;sql&quot;:{&quot;type&quot;:&quot;string&quot;}},&quot;type&quot;:&quot;object&quot;}</input_schema>`) {
+		t.Fatal("compiled prompt missing hydrated input_schema when description already existed")
 	}
 }
 

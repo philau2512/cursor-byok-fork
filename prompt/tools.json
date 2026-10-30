@@ -70,7 +70,7 @@
     },
     {
       "function": {
-        "description": "Call an MCP tool by server identifier and tool name with arbitrary JSON arguments. Use the matching descriptor in <mcp_meta_tools>: follow its inline input_schema, or read its definition_path when the schema is stored in a file. Call listed tools directly. If Cursor returns an MCP error, inspect it, correct the arguments or authentication, and retry only when appropriate.\n\nExample:\n{\n  \"server\": \"my-mcp-server\",\n  \"toolName\": \"search\",\n  \"arguments\": { \"query\": \"example\", \"limit\": 10 }\n}",
+        "description": "Call an MCP tool by server identifier and tool name with structured arguments matching the tool's parameter schema. Follow the inline <input_schema> provided inside each <mcp_tool> descriptor in context. If <input_schema> is missing, read the schema file at <definition_path> using Read before calling. Call listed tools directly. If Cursor returns an MCP error, inspect it, correct the arguments or authentication, and retry only when appropriate.\n\nExample:\n{\n  \"server\": \"my-mcp-server\",\n  \"toolName\": \"search\",\n  \"arguments\": { \"query\": \"example\", \"limit\": 10 }\n}",
         "name": "CallMcpTool",
         "parameters": {
           "properties": {

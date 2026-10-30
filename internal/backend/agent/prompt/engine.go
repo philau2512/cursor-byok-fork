@@ -828,7 +828,11 @@ func buildEmbeddedMCPDescriptorSection(descriptor *agentv1.McpDescriptor, server
 		if description != "" {
 			entry += "\n<description>" + escapePromptXML(description) + "</description>"
 		}
-		if inputSchema := strings.TrimSpace(compactProtoJSON(tool.GetInputSchema())); inputSchema != "" {
+		inputSchema := strings.TrimSpace(tool.GetInputSchemaJson())
+		if inputSchema == "" && tool.GetInputSchema() != nil {
+			inputSchema = strings.TrimSpace(compactProtoJSON(tool.GetInputSchema()))
+		}
+		if inputSchema != "" {
 			entry += "\n<input_schema>" + escapePromptXML(inputSchema) + "</input_schema>"
 		}
 		entry += "\n</mcp_tool>"
