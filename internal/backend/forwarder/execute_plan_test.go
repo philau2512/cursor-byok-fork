@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"cursor/gen/agentv1"
+	runtimecore "cursor/internal/backend/agent/core"
 )
 
 func TestExtractConversationActionUserMessage_ExecutePlanAction(t *testing.T) {
@@ -138,6 +139,44 @@ func TestFilterUnprocessedUserMessages(t *testing.T) {
 	_, _, allExistWork := filterUnprocessedUserMessages(intent, conv)
 	if allExistWork {
 		t.Fatal("expected allExistWork to be false when all messages exist in history")
+	}
+}
+
+func TestShouldAutoResumeAfterCreatePlanInteraction(t *testing.T) {
+	pending := runtimecore.PendingInteraction{
+		InteractionKind: "create_plan",
+	}
+	if !shouldAutoResumeAfterInteraction(pending) {
+		t.Fatal("expected shouldAutoResumeAfterInteraction to return true for create_plan so AI continues automatically")
+	}
+}
+
+func TestShouldMergeTodoUpdate_ExplicitFalseForNewTask(t *testing.T) {
+	args := &agentv1.UpdateTodosArgs{
+		Todos: []*agentv1.TodoItem{
+			{Id: "task-1", Content: "Task 1", Status: agentv1.TodoStatus_TODO_STATUS_PENDING},
+		},
+		Merge: false,
+	}
+	existing := []*agentv1.TodoItem{
+		{Id: "old-1", Content: "Old Task", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+	}
+	if shouldMergeTodoUpdate(args, true, existing) {
+		t.Fatal("expected shouldMergeTodoUpdate to return false when merge is explicitly false for new task")
+	}
+}
+
+func TestMissingActiveTodoReplacementIDs_CompletedOldTasks(t *testing.T) {
+	existing := []*agentv1.TodoItem{
+		{Id: "old-1", Content: "Old Task 1", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+		{Id: "old-2", Content: "Old Task 2", Status: agentv1.TodoStatus_TODO_STATUS_COMPLETED},
+	}
+	newTodos := []*agentv1.TodoItem{
+		{Id: "new-1", Content: "New Task 1", Status: agentv1.TodoStatus_TODO_STATUS_PENDING},
+	}
+	missing := missingActiveTodoReplacementIDs(existing, newTodos)
+	if len(missing) > 0 {
+		t.Fatalf("expected no missing active ids when all existing tasks are completed, got: %v", missing)
 	}
 }
 

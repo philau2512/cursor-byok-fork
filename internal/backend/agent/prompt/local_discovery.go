@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +40,9 @@ func getCandidateRoots(requestContext *agentv1.RequestContext) []string {
 			for _, wp := range env.GetWorkspacePaths() {
 				addRoot(wp)
 			}
-			addRoot(env.GetProjectFolder())
+			if pf := env.GetProjectFolder(); !isCursorInternalProjectFolder(pf) {
+				addRoot(pf)
+			}
 		}
 		for _, repo := range requestContext.GetGitRepos() {
 			if repo != nil {
@@ -71,10 +75,25 @@ func getCandidateRoots(requestContext *agentv1.RequestContext) []string {
 	return roots
 }
 
+func isCursorInternalProjectFolder(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return false
+	}
+	slash := strings.ToLower(filepath.ToSlash(trimmed))
+	return strings.Contains(slash, "/.cursor/projects")
+}
+
 func hasProjectMarker(dir string) bool {
+	cleanDir := filepath.Clean(dir)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if strings.EqualFold(cleanDir, filepath.Clean(home)) {
+			return false
+		}
+	}
 	markers := []string{".cursor", ".agents", ".git"}
 	for _, m := range markers {
-		if info, err := os.Stat(filepath.Join(dir, m)); err == nil && info.IsDir() {
+		if info, err := os.Stat(filepath.Join(cleanDir, m)); err == nil && info.IsDir() {
 			return true
 		}
 	}
@@ -335,6 +354,282 @@ func addAgentFromFile(requestContext *agentv1.RequestContext, absPath string, de
 		Model:       model,
 		Prompt:      body,
 	})
+}
+
+const (
+	maxAgentRuleScanDepth = 5
+	maxAgentRuleFileSize  = 64 * 1024
+	maxAgentRuleFileCount = 30
+)
+
+func isIgnoredDirForAgentRuleScan(name string) bool {
+	switch strings.ToLower(name) {
+	case ".git", ".github", ".vscode", ".idea", ".next", ".nuxt", ".output", ".turbo", ".cache",
+		"__pycache__", ".venv", "venv", "env", "node_modules", "vendor", "target", "dist",
+		"build", "out", "bin", "obj", "coverage", "tmp", "temp", "appdata":
+		return true
+	}
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	return false
+}
+
+func isAgentRuleFileName(name string) bool {
+	return strings.EqualFold(name, "AGENTS.md") || strings.EqualFold(name, "AGENT.md")
+}
+
+func getWorkspaceRootsForAgentRules(requestContext *agentv1.RequestContext) []string {
+	seen := make(map[string]struct{})
+	var roots []string
+
+	homeDir, _ := os.UserHomeDir()
+	cleanHome := ""
+	if homeDir != "" {
+		cleanHome = strings.ToLower(filepath.ToSlash(filepath.Clean(homeDir)))
+	}
+
+	addRoot := func(p string) {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			return
+		}
+		clean := filepath.Clean(trimmed)
+		key := strings.ToLower(filepath.ToSlash(clean))
+
+		// Tuyệt đối không dùng thư mục home của user làm workspace root cho AGENTS.md
+		if cleanHome != "" && key == cleanHome {
+			return
+		}
+		// Bỏ qua thư mục cache nội bộ .cursor/projects của Cursor
+		if isCursorInternalProjectFolder(clean) {
+			return
+		}
+
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			roots = append(roots, clean)
+		}
+	}
+
+	if requestContext != nil {
+		if env := requestContext.GetEnv(); env != nil {
+			for _, wp := range env.GetWorkspacePaths() {
+				addRoot(wp)
+			}
+			if pf := env.GetProjectFolder(); !isCursorInternalProjectFolder(pf) {
+				addRoot(pf)
+			}
+		}
+		if len(roots) == 0 {
+			for _, repo := range requestContext.GetGitRepos() {
+				if repo != nil {
+					addRoot(repo.GetPath())
+				}
+			}
+		}
+	}
+
+	if len(roots) == 0 {
+		if wd, err := os.Getwd(); err == nil && wd != "" {
+			addRoot(wd)
+		}
+	}
+
+	return roots
+}
+
+type discoveredAgentRule struct {
+	fullPath string
+	relPath  string
+	depth    int
+	content  string
+}
+
+var (
+	agentRulesCacheMu sync.RWMutex
+	agentRulesCache   = make(map[string]cachedAgentRules)
+)
+
+type cachedAgentRules struct {
+	cachedAt time.Time
+	rules    []discoveredAgentRule
+}
+
+// InvalidateAgentRulesCache 清理工作区 agent rules 的内存缓存，确保只在用户发送新消息时重新扫盘。
+func InvalidateAgentRulesCache() {
+	agentRulesCacheMu.Lock()
+	agentRulesCache = make(map[string]cachedAgentRules)
+	agentRulesCacheMu.Unlock()
+}
+
+// mergeLocalAgentRules 递归发现工作区各层级目录下的 AGENTS.md / AGENT.md 文件，并按层级合并至 requestContext.Rules。
+func mergeLocalAgentRules(requestContext *agentv1.RequestContext) {
+	if requestContext == nil {
+		return
+	}
+
+	knownPaths := make(map[string]struct{})
+	for _, rule := range requestContext.GetRules() {
+		if rule == nil {
+			continue
+		}
+		pathKey := strings.ToLower(filepath.ToSlash(filepath.Clean(rule.GetFullPath())))
+		if pathKey != "" {
+			knownPaths[pathKey] = struct{}{}
+		}
+	}
+
+	roots := getWorkspaceRootsForAgentRules(requestContext)
+	var discovered []discoveredAgentRule
+
+	for _, root := range roots {
+		cleanRoot := filepath.Clean(root)
+		rootKey := strings.ToLower(filepath.ToSlash(cleanRoot))
+
+		agentRulesCacheMu.RLock()
+		cached, found := agentRulesCache[rootKey]
+		agentRulesCacheMu.RUnlock()
+
+		if found {
+			for _, item := range cached.rules {
+				pathKey := strings.ToLower(filepath.ToSlash(filepath.Clean(item.fullPath)))
+				if _, ok := knownPaths[pathKey]; !ok {
+					knownPaths[pathKey] = struct{}{}
+					discovered = append(discovered, item)
+				}
+			}
+			continue
+		}
+
+		info, err := os.Stat(cleanRoot)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+
+		var rootDiscovered []discoveredAgentRule
+		_ = filepath.WalkDir(cleanRoot, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+
+			if d.IsDir() {
+				if cleanRoot == path {
+					return nil
+				}
+				name := d.Name()
+				if isIgnoredDirForAgentRuleScan(name) {
+					return filepath.SkipDir
+				}
+				rel, relErr := filepath.Rel(cleanRoot, path)
+				if relErr == nil {
+					depth := len(strings.Split(filepath.ToSlash(rel), "/"))
+					if depth > maxAgentRuleScanDepth {
+						return filepath.SkipDir
+					}
+				}
+				return nil
+			}
+
+			if len(rootDiscovered) >= maxAgentRuleFileCount {
+				return nil
+			}
+
+			if !isAgentRuleFileName(d.Name()) {
+				return nil
+			}
+
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				absPath = path
+			}
+			pathKey := strings.ToLower(filepath.ToSlash(filepath.Clean(absPath)))
+			if _, ok := knownPaths[pathKey]; ok {
+				return nil
+			}
+
+			fileInfo, err := d.Info()
+			if err != nil || fileInfo.Size() > maxAgentRuleFileSize {
+				return nil
+			}
+
+			contentBytes, err := os.ReadFile(absPath)
+			if err != nil || len(bytes.TrimSpace(contentBytes)) == 0 {
+				return nil
+			}
+
+			content := string(contentBytes)
+			_, body := parseFrontmatter(content)
+			ruleText := strings.TrimSpace(body)
+			if ruleText == "" {
+				ruleText = strings.TrimSpace(content)
+			}
+			if ruleText == "" {
+				return nil
+			}
+
+			relPath, err := filepath.Rel(cleanRoot, absPath)
+			if err != nil {
+				relPath = d.Name()
+			}
+			relSlash := filepath.ToSlash(relPath)
+			depth := 0
+			if relSlash != "." && relSlash != d.Name() {
+				parts := strings.Split(relSlash, "/")
+				depth = len(parts) - 1
+			}
+
+			rootDiscovered = append(rootDiscovered, discoveredAgentRule{
+				fullPath: absPath,
+				relPath:  relSlash,
+				depth:    depth,
+				content:  ruleText,
+			})
+			return nil
+		})
+
+		agentRulesCacheMu.Lock()
+		agentRulesCache[rootKey] = cachedAgentRules{
+			cachedAt: time.Now(),
+			rules:    rootDiscovered,
+		}
+		agentRulesCacheMu.Unlock()
+
+		for _, item := range rootDiscovered {
+			pathKey := strings.ToLower(filepath.ToSlash(filepath.Clean(item.fullPath)))
+			if _, ok := knownPaths[pathKey]; !ok {
+				knownPaths[pathKey] = struct{}{}
+				discovered = append(discovered, item)
+			}
+		}
+	}
+
+	if len(discovered) == 0 {
+		return
+	}
+
+	sort.SliceStable(discovered, func(i, j int) bool {
+		if discovered[i].depth != discovered[j].depth {
+			return discovered[i].depth < discovered[j].depth
+		}
+		return discovered[i].relPath < discovered[j].relPath
+	})
+
+	for _, item := range discovered {
+		var header string
+		dirPart := filepath.ToSlash(filepath.Dir(item.relPath))
+		if dirPart == "." || dirPart == "" {
+			header = fmt.Sprintf("# Project Rule: %s (Root Workspace)", item.relPath)
+		} else {
+			header = fmt.Sprintf("# Project Rule: %s (Scope: %s/)", item.relPath, dirPart)
+		}
+
+		formatted := fmt.Sprintf("%s\n\n%s", header, item.content)
+		requestContext.Rules = append(requestContext.Rules, &agentv1.CursorRule{
+			FullPath: item.fullPath,
+			Content:  formatted,
+		})
+	}
 }
 
 type mcpToolFilePayload struct {

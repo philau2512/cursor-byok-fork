@@ -806,6 +806,9 @@ func (service *Service) executeSerializedRun(intent InboundIntent) error {
 // handleRunIntent 处理 run/prewarm 类 intent，负责建会话、写 turn 和拉起 provider。
 func (service *Service) handleRunIntent(intent InboundIntent) error {
 	intent.UserMessage = normalizeUserMessageForStorage(intent.UserMessage)
+	if intent.UserMessage != nil {
+		promptengine.InvalidateAgentRulesCache()
+	}
 	if !intent.Prewarm {
 		service.cancelOtherConversationActors(
 			intent.ConversationID,

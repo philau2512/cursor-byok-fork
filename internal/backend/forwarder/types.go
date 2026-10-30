@@ -176,6 +176,7 @@ type ActiveStream struct {
 	ProviderFinishReason                        string
 	ProviderUsage                               turnUsageSnapshot
 	ProviderTerminalToolInvocation              bool
+	PendingTodoResetOnNewPlan                   bool
 	PendingCompaction                           *PendingCompaction
 	PendingCheckpointBlobWrites                 map[uint32]pendingCheckpointBlobWrite
 	ConfirmedCheckpointBlobs                    map[string]struct{}

@@ -58,7 +58,196 @@ func computeEditDiff(beforeContent string, afterContent string) (string, int32, 
 			linesRemoved += countChangedLines(diff.Text)
 		}
 	}
-	return dmp.PatchToText(dmp.PatchMake(beforeContent, diffs)), linesAdded, linesRemoved
+	return renderUnifiedDiff(beforeContent, afterContent, diffs), linesAdded, linesRemoved
+}
+
+type lineDiffItem struct {
+	op   diffmatchpatch.Operation
+	text string
+}
+
+func renderUnifiedDiff(beforeContent string, afterContent string, diffs []diffmatchpatch.Diff) string {
+	if beforeContent == afterContent {
+		return ""
+	}
+
+	if beforeContent == "" {
+		lines := splitLinesForUnifiedDiff(afterContent)
+		if len(lines) == 0 {
+			return ""
+		}
+		var builder strings.Builder
+		count := len(lines)
+		if count == 1 {
+			builder.WriteString("@@ -0,0 +1 @@\n")
+		} else {
+			fmt.Fprintf(&builder, "@@ -0,0 +1,%d @@\n", count)
+		}
+		for _, line := range lines {
+			builder.WriteByte('+')
+			builder.WriteString(line)
+			builder.WriteByte('\n')
+		}
+		return builder.String()
+	}
+
+	if afterContent == "" {
+		lines := splitLinesForUnifiedDiff(beforeContent)
+		if len(lines) == 0 {
+			return ""
+		}
+		var builder strings.Builder
+		count := len(lines)
+		if count == 1 {
+			builder.WriteString("@@ -1 +0,0 @@\n")
+		} else {
+			fmt.Fprintf(&builder, "@@ -1,%d +0,0 @@\n", count)
+		}
+		for _, line := range lines {
+			builder.WriteByte('-')
+			builder.WriteString(line)
+			builder.WriteByte('\n')
+		}
+		return builder.String()
+	}
+
+	items := splitDiffLines(diffs)
+	if len(items) == 0 {
+		return ""
+	}
+
+	const contextRadius = 3
+
+	hasChanges := false
+	isChange := make([]bool, len(items))
+	for i, item := range items {
+		if item.op != diffmatchpatch.DiffEqual {
+			isChange[i] = true
+			hasChanges = true
+		}
+	}
+	if !hasChanges {
+		return ""
+	}
+
+	include := make([]bool, len(items))
+	for i, ch := range isChange {
+		if !ch {
+			continue
+		}
+		start := max(0, i-contextRadius)
+		end := min(len(items)-1, i+contextRadius)
+		for j := start; j <= end; j++ {
+			include[j] = true
+		}
+	}
+
+	origLineNum := 1
+	newLineNum := 1
+
+	var builder strings.Builder
+	idx := 0
+	for idx < len(items) {
+		if !include[idx] {
+			switch items[idx].op {
+			case diffmatchpatch.DiffEqual:
+				origLineNum++
+				newLineNum++
+			case diffmatchpatch.DiffDelete:
+				origLineNum++
+			case diffmatchpatch.DiffInsert:
+				newLineNum++
+			}
+			idx++
+			continue
+		}
+
+		hunkStart := idx
+		for idx < len(items) && include[idx] {
+			idx++
+		}
+		hunkEnd := idx
+
+		hunkOrigStart := origLineNum
+		hunkNewStart := newLineNum
+		hunkOrigCount := 0
+		hunkNewCount := 0
+
+		for j := hunkStart; j < hunkEnd; j++ {
+			switch items[j].op {
+			case diffmatchpatch.DiffEqual:
+				hunkOrigCount++
+				hunkNewCount++
+				origLineNum++
+				newLineNum++
+			case diffmatchpatch.DiffDelete:
+				hunkOrigCount++
+				origLineNum++
+			case diffmatchpatch.DiffInsert:
+				hunkNewCount++
+				newLineNum++
+			}
+		}
+
+		s1 := formatHunkRange(hunkOrigStart, hunkOrigCount, "-")
+		s2 := formatHunkRange(hunkNewStart, hunkNewCount, "+")
+		fmt.Fprintf(&builder, "@@ %s %s @@\n", s1, s2)
+
+		for j := hunkStart; j < hunkEnd; j++ {
+			switch items[j].op {
+			case diffmatchpatch.DiffEqual:
+				builder.WriteByte(' ')
+			case diffmatchpatch.DiffDelete:
+				builder.WriteByte('-')
+			case diffmatchpatch.DiffInsert:
+				builder.WriteByte('+')
+			}
+			builder.WriteString(items[j].text)
+			builder.WriteByte('\n')
+		}
+	}
+
+	return builder.String()
+}
+
+func formatHunkRange(start int, count int, prefix string) string {
+	if count == 0 {
+		if start == 1 {
+			start = 0
+		}
+		return fmt.Sprintf("%s%d,0", prefix, start)
+	}
+	if count == 1 {
+		return fmt.Sprintf("%s%d", prefix, start)
+	}
+	return fmt.Sprintf("%s%d,%d", prefix, start, count)
+}
+
+func splitLinesForUnifiedDiff(text string) []string {
+	if text == "" {
+		return nil
+	}
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	rawLines := strings.Split(normalized, "\n")
+	if len(rawLines) > 0 && rawLines[len(rawLines)-1] == "" {
+		rawLines = rawLines[:len(rawLines)-1]
+	}
+	return rawLines
+}
+
+func splitDiffLines(diffs []diffmatchpatch.Diff) []lineDiffItem {
+	var items []lineDiffItem
+	for _, d := range diffs {
+		if d.Text == "" {
+			continue
+		}
+		lines := splitLinesForUnifiedDiff(d.Text)
+		for _, line := range lines {
+			items = append(items, lineDiffItem{op: d.Type, text: line})
+		}
+	}
+	return items
 }
 
 func normalizeEditContentLineEndings(content string) normalizedEditContent {

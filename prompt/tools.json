@@ -369,13 +369,13 @@
       "type": "function",
       "function": {
         "name": "AwaitShell",
-        "description": "Check or poll a backgrounded Shell job. Use this after Shell returns a shell_id. If Shell returned a shell_id for a known background job, every AwaitShell call for that job MUST pass that exact non-empty shell_id. Never omit shell_id or pass an empty string when polling a known background job. Omitting shell_id is allowed only when there is no known background job and the caller intentionally wants a timed wait. If multiple jobs are running, explicitly pass the shell_id for the intended job. Pattern matching checks accumulated stdout/stderr content, not terminal metadata.\n\nDo not poll reflexively while unrelated work can continue. However, you MUST call AwaitShell with the matching shell_id before reporting that a background job has completed, passed, failed, produced an artifact, or is ready for the user. This is required whenever the user's request depends on the job result, including builds, tests, deployments, downloads, migrations, packaging, and artifact generation.\n\nIf ending the turn while a job is still running, explicitly state that it is still running; do not imply completion. Do not mark a related task complete or send a final result until AwaitShell returns completion for that job. After AwaitShell reports completion, inspect the exit code and final output. For commands expected to generate files, also verify the expected artifact exists before reporting its path.",
+        "description": "Check or poll a backgrounded Shell job. Use this after Shell returns a shell_id. If Shell returned a shell_id for a known background job, every AwaitShell call for that job MUST pass that exact non-empty shell_id. Never omit shell_id or pass an empty string when polling a known background job. Omitting shell_id is allowed only when there is no known background job and the caller intentionally wants a timed wait. If multiple jobs are running, explicitly pass the shell_id for the intended job. Pattern matching checks accumulated stdout/stderr content, not terminal metadata.\n\nDo not poll reflexively while unrelated work can continue. However, you MUST call AwaitShell with the matching shell_id before reporting that a background job has completed, passed, failed, produced an artifact, or is ready for the user. This is required whenever the user's request depends on the job result, including builds, tests, deployments, downloads, migrations, packaging, and artifact generation.\n\nIf ending the turn while a job is still running, explicitly state that it is still running; do not imply completion. Do not mark a related task complete or send a final result until AwaitShell returns completion for that job. After AwaitShell reports completion, inspect the exit code and final output. For commands expected to generate files, also verify the expected artifact exists before reporting its path. If AwaitShell times out or if you need to check full output/status directly, you can also proactively inspect the terminal session file (<terminals_folder>/$id.txt) using Read.",
         "parameters": {
           "type": "object",
           "properties": {
             "shell_id": {
               "type": "string",
-              "description": "Optional shell id to poll. Required when block_until_ms is 0."
+              "description": "Optional shell id to poll (number or string). Required when block_until_ms is 0."
             },
             "block_until_ms": {
               "type": "number",
@@ -540,12 +540,12 @@
     },
     {
       "function": {
-        "description": "Use this tool to create and manage a structured task list for your current coding session.",
+        "description": "Use this tool to manage and update the status of todos in the active checklist. When starting a new task or plan, call TodoWrite with merge=false to clear previous tasks from the UI and initialize the new checklist. During execution, update task status with merge=true (set status='in_progress' when starting a step, and status='completed' when finished).",
         "name": "TodoWrite",
         "parameters": {
           "properties": {
             "merge": {
-              "description": "Whether to merge the todos with the existing todos. If true, the todos will be merged into the existing todos based on the id field. Use true for normal incremental updates, marking items complete, adding follow-ups, or changing the current in-progress item. If false, the new todos replace the entire list and must include every existing todo id once a list already exists.",
+              "description": "Whether to merge the todos with existing todos. IMPORTANT: Set merge=false when initializing a checklist for a new task or new plan to clear old tasks and replace the list. Set merge=true for incremental progress updates by id without overwriting the list.",
               "type": "boolean"
             },
             "todos": {
@@ -633,7 +633,7 @@
     },
     {
       "function": {
-        "description": "Use this tool to create or revise a concise plan for accomplishing the user's request. It is available when saving or updating a plan in the plan UI would help the user. Use it only when the user requests a persisted plan or when an explicit planning workflow requires it; a textual plan is sufficient otherwise.\n\nThe plan you create should be properly formatted in markdown, using appropriate sections and headers. The plan should be very concise and actionable, providing the minimum amount of detail for the user to understand and action the plan. Cite specific file paths and essential snippets of code. IMPORTANT: Do NOT use markdown tables in plan content (they cannot be rendered for the user); use bullet lists instead. The first line MUST BE A TITLE for the plan formatted as a level 1 markdown heading.\n\nTASK ORGANIZATION:\n\nUse 'todos' for organizing implementation tasks:\n- Each todo should be a clear, specific, and actionable task\n- Each todo needs a unique ID (e.g., \"setup-auth\") and descriptive content\n- If the plan is simple, provide just a few high-level todos or none at all\n\nUPDATING THE PLAN:\n- If a current plan already exists, submit the complete revised plan and omit the name field\n- Only the first CreatePlan call may include name; later calls must not include name and must not use name to rename or create a separate plan\n\nAdditional guidelines:\n- Avoid asking clarifying questions in the plan itself. Ask them before calling this tool using the AskQuestion tool.\n- Todos help break down complex plans into manageable, trackable tasks\n- Focus on high-level meaningful decisions rather than low-level implementation details\n- A good plan is glanceable, not a wall of text.",
+        "description": "Use this tool to create or revise an interactive plan and task checklist in the UI.\n\nEXECUTION MODES:\n1. Normal Task Execution: When the user asks to implement, fix, review, or do work, call CreatePlan with a lightweight title (e.g. '# Checklist: <Task>') and actionable 'todos' to show the UI checklist. Do NOT stop or wait for confirmation; immediately proceed to execute the tasks, updating statuses with TodoWrite ('in_progress', 'completed').\n2. Explicit Planning: When the user explicitly asks to plan ('lên plan', 'lập kế hoạch', 'plan first'), provide a detailed plan document with 'todos', and pause to await user review before implementing.\n\nTASK ORGANIZATION:\n- Each todo must have a unique ID and concise, actionable content.",
         "name": "CreatePlan",
         "parameters": {
           "properties": {

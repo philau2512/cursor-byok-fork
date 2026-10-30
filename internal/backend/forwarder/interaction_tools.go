@@ -71,6 +71,11 @@ func (service *Service) handleInteractionResult(intent InboundIntent) error {
 	}
 	markInteractionCompleted(stream, pending)
 	toolName := strings.TrimSpace(deriveToolNameFromPendingInteraction(pending))
+	if toolName == "CreatePlan" {
+		stream.mu.Lock()
+		stream.PendingTodoResetOnNewPlan = true
+		stream.mu.Unlock()
+	}
 	if result.ToolCall != nil {
 		applySwitchModeMetadata(stream, result.ToolCall)
 		if err := service.appendToolResult(stream, result.ToolCallID, toolName, pending.ArgsJSON, result.ToolResultPayload, pending.ReasoningContent, result.ToolCall); err != nil {
@@ -207,12 +212,9 @@ func isInteractionTool(name string) bool {
 }
 
 func shouldAutoResumeAfterInteraction(pending runtimecore.PendingInteraction) bool {
-	switch strings.TrimSpace(pending.InteractionKind) {
-	case "create_plan":
-		return false
-	default:
-		return true
-	}
+	// Tự động tiếp tục vòng lặp model sau khi tạo plan thành công,
+	// giúp AI tự động thực thi các bước tiếp theo mà không bị ngắt stream chờ click thủ công.
+	return true
 }
 
 type generateImageToolCarrier struct {
@@ -432,7 +434,17 @@ func (service *Service) handleTodoWriteToolInvocation(stream *ActiveStream, invo
 		return err
 	}
 	now := time.Now().UTC()
+	stream.mu.Lock()
+	pendingPlanReset := stream.PendingTodoResetOnNewPlan
+	if pendingPlanReset {
+		stream.PendingTodoResetOnNewPlan = false
+	}
+	stream.mu.Unlock()
+
 	applyMerge := shouldMergeTodoUpdate(args, decodedArgs.MergeSet, structuredState.Todos)
+	if pendingPlanReset {
+		applyMerge = false
+	}
 	args.Merge = applyMerge
 	var nextTodos []*agentv1.TodoItem
 	if applyMerge {
@@ -444,7 +456,7 @@ func (service *Service) handleTodoWriteToolInvocation(stream *ActiveStream, invo
 		result := buildUpdateTodosErrorResult(args, err.Error())
 		return service.completeImmediateToolResult(stream, invocation, summarizeUpdateTodosResult(result), buildUpdateTodosToolCall(args, result))
 	}
-	if !applyMerge {
+	if !applyMerge && !pendingPlanReset {
 		if missingIDs := missingActiveTodoReplacementIDs(structuredState.Todos, nextTodos); len(missingIDs) > 0 {
 			result := buildUpdateTodosErrorResult(args, unsafeTodoReplaceError(missingIDs))
 			return service.completeImmediateToolResult(stream, invocation, summarizeUpdateTodosResult(result), buildUpdateTodosToolCall(args, result))

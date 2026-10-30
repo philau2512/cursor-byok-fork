@@ -320,18 +320,33 @@ func hiddenEditCompletionCount(stream *ActiveStream, toolCallID string) int {
 }
 
 func TestComputeEditDiffCountsNewFileLines(t *testing.T) {
-	lines := make([]string, 102)
+	lines := make([]string, 155)
 	for index := range lines {
 		lines[index] = fmt.Sprintf("line-%03d", index+1)
 	}
 	content := strings.Join(lines, "\n") + "\n"
 
 	diffString, linesAdded, linesRemoved := computeEditDiff("", content)
-	if linesAdded != 102 || linesRemoved != 0 {
-		t.Fatalf("new file diff lines = (+%d, -%d), want (+102, -0)", linesAdded, linesRemoved)
+	if linesAdded != 155 || linesRemoved != 0 {
+		t.Fatalf("new file diff lines = (+%d, -%d), want (+155, -0)", linesAdded, linesRemoved)
 	}
 	if diffString == "" {
 		t.Fatal("new file diff string is empty")
+	}
+
+	expectedHeader := "@@ -0,0 +1,155 @@\n"
+	if !strings.HasPrefix(diffString, expectedHeader) {
+		t.Fatalf("diffString header = %q, want prefix %q", diffString, expectedHeader)
+	}
+
+	plusLineCount := 0
+	for _, line := range strings.Split(diffString, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			plusLineCount++
+		}
+	}
+	if plusLineCount != 155 {
+		t.Fatalf("diffString plus-prefixed lines = %d, want 155 (previously was 1 due to %%0A encoding)", plusLineCount)
 	}
 
 	result := buildSuccessfulWriteResult(`C:\\workspace\\new.go`, "", content)
