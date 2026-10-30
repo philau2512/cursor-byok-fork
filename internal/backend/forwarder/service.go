@@ -78,10 +78,24 @@ func parseSubagentModelOverrides(items []*agentv1.SubagentModelOverride) parsedS
 				parsed.Ignored = append(parsed.Ignored, map[string]any{"index": index, "subagent_type": subagentType, "reason": "empty_model_id"})
 				continue
 			}
+			effort := extractRuntimeThinkingEffortFromRequestedModel(model)
+			cleanModelID := extractRequestedModelIDFromRequestedModel(model)
+			if cleanModelID == "" {
+				cleanModelID = modelID
+			}
+			if effort == "" {
+				if parsedModel, parsedEffort := splitRuntimeThinkingEffortVariantString(cleanModelID); parsedEffort != "" {
+					effort = parsedEffort
+					if parsedModel != "" {
+						cleanModelID = parsedModel
+					}
+				}
+			}
 			parsedSelection = runtimecore.SubagentModelOverrideSelection{
 				SubagentType:                  subagentType,
 				Selection:                     "model",
-				ModelID:                       modelID,
+				ModelID:                       cleanModelID,
+				ThinkingEffort:                effort,
 				MaxMode:                       model.GetMaxMode(),
 				ParameterCount:                len(model.GetParameters()),
 				BuiltInModel:                  model.GetBuiltInModel(),
@@ -131,6 +145,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 	subagentType := readStringMapValue(args, "subagent_type", "subagentType")
 	taskRequestedModelID := readStringMapValue(args, "model", "model_id", "modelId")
 	effectiveModelID := taskRequestedModelID
+	effectiveThinkingEffort := ""
 	selection := "none"
 	disabled := false
 	overrideHit := false
@@ -142,6 +157,7 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 		switch selection {
 		case "model":
 			effectiveModelID = strings.TrimSpace(override.ModelID)
+			effectiveThinkingEffort = strings.TrimSpace(override.ThinkingEffort)
 		case "inherit":
 			effectiveModelID = strings.TrimSpace(parentModelID)
 		case "disabled":
@@ -161,6 +177,9 @@ func taskSubagentModelResolutionPayload(invocation runtimecore.ToolInvocation, p
 		"parent_model_id":         strings.TrimSpace(parentModelID),
 		"effective_model_id":      strings.TrimSpace(effectiveModelID),
 		"disabled":                disabled,
+	}
+	if effectiveThinkingEffort != "" {
+		payload["effective_thinking_effort"] = effectiveThinkingEffort
 	}
 	if matchedSubagentType != "" {
 		payload["matched_subagent_type"] = matchedSubagentType
@@ -247,6 +266,9 @@ func subagentModelOverrideSummaries(overrides map[string]runtimecore.SubagentMod
 		}
 		if strings.TrimSpace(selection.ModelID) != "" {
 			summary["model_id"] = strings.TrimSpace(selection.ModelID)
+		}
+		if strings.TrimSpace(selection.ThinkingEffort) != "" {
+			summary["thinking_effort"] = strings.TrimSpace(selection.ThinkingEffort)
 		}
 		if selection.MaxMode {
 			summary["max_mode"] = true
@@ -642,10 +664,17 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 			"overrides":      subagentModelOverrideSummaries(parsedOverrides.Overrides),
 			"ignored":        parsedOverrides.Ignored,
 		})
-		if (intent.ModelID == "" || intent.ModelID == "default") && intent.SubagentTypeName != "" {
+		if intent.SubagentTypeName != "" {
 			if override, _, ok := runtimecore.LookupSubagentModelOverride(intent.SubagentModelOverrides, intent.SubagentTypeName); ok {
-				if strings.TrimSpace(override.Selection) == "model" && strings.TrimSpace(override.ModelID) != "" {
-					intent.ModelID = strings.TrimSpace(override.ModelID)
+				if strings.TrimSpace(override.Selection) == "model" {
+					if strings.TrimSpace(override.ModelID) != "" && (intent.ModelID == "" || intent.ModelID == "default") {
+						intent.ModelID = strings.TrimSpace(override.ModelID)
+					}
+					if strings.TrimSpace(override.ThinkingEffort) != "" {
+						intent.ThinkingEffort = strings.TrimSpace(override.ThinkingEffort)
+					} else {
+						intent.ThinkingEffort = ""
+					}
 				}
 			}
 		}
@@ -676,6 +705,22 @@ func (service *Service) decodeInboundIntent(requestID string, message *agentv1.A
 		intent.ModelID = firstNonEmpty(extractRequestedModelID(message), "default")
 		intent.ThinkingEffort = extractRuntimeThinkingEffort(message)
 		intent.RequestedContextTokens = extractRequestedContextTokens(message)
+		parsedOverrides := parseSubagentModelOverrides(prewarmRequest.GetSubagentModelOverrides())
+		intent.SubagentModelOverrides = parsedOverrides.Overrides
+		if intent.SubagentTypeName != "" {
+			if override, _, ok := runtimecore.LookupSubagentModelOverride(intent.SubagentModelOverrides, intent.SubagentTypeName); ok {
+				if strings.TrimSpace(override.Selection) == "model" {
+					if strings.TrimSpace(override.ModelID) != "" && (intent.ModelID == "" || intent.ModelID == "default") {
+						intent.ModelID = strings.TrimSpace(override.ModelID)
+					}
+					if strings.TrimSpace(override.ThinkingEffort) != "" {
+						intent.ThinkingEffort = strings.TrimSpace(override.ThinkingEffort)
+					} else {
+						intent.ThinkingEffort = ""
+					}
+				}
+			}
+		}
 		intent.ModelName = service.resolveRequestedModelName(message, intent.ModelID)
 	case "conversation_action":
 		action := message.GetConversationAction()

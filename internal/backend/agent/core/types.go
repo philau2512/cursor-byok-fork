@@ -18,6 +18,7 @@ type SubagentModelOverrideSelection struct {
 	SubagentType                  string `json:"subagent_type"`
 	Selection                     string `json:"selection"`
 	ModelID                       string `json:"model_id,omitempty"`
+	ThinkingEffort                string `json:"thinking_effort,omitempty"`
 	MaxMode                       bool   `json:"max_mode,omitempty"`
 	ParameterCount                int    `json:"parameter_count,omitempty"`
 	BuiltInModel                  bool   `json:"built_in_model,omitempty"`

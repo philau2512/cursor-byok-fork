@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
 	"cursor/gen/agentv1"
 	runtimecore "cursor/internal/backend/agent/core"
 )
@@ -230,5 +232,139 @@ func TestExtractRequestedContextTokensAndVariantString(t *testing.T) {
 				t.Errorf("extractRequestedModelID = %v, want %v", gotModel, tc.wantModel)
 			}
 		})
+	}
+}
+
+func TestParseSubagentModelOverridesExtractsThinkingEffort(t *testing.T) {
+	items := []*agentv1.SubagentModelOverride{
+		{
+			SubagentType: "Explorer",
+			Selection: &agentv1.SubagentModelOverride_Model{
+				Model: &agentv1.RequestedModel{
+					ModelId: "9antigravity",
+					Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+						{Id: "thinking_effort", Value: "medium"},
+					},
+				},
+			},
+		},
+		{
+			SubagentType: "debugger",
+			Selection: &agentv1.SubagentModelOverride_Model{
+				Model: &agentv1.RequestedModel{
+					ModelId:                       "claude-3-7-sonnet:high",
+					IsVariantStringRepresentation: true,
+				},
+			},
+		},
+		{
+			SubagentType: "planner",
+			Selection: &agentv1.SubagentModelOverride_Model{
+				Model: &agentv1.RequestedModel{
+					ModelId:                       "custom[context=356k,reasoning=low]",
+					IsVariantStringRepresentation: true,
+				},
+			},
+		},
+	}
+
+	parsed := parseSubagentModelOverrides(items)
+	if override, ok := parsed.Overrides["Explorer"]; !ok || override.ThinkingEffort != "medium" || override.ModelID != "9antigravity" {
+		t.Errorf("expected Explorer ThinkingEffort=medium, ModelID=9antigravity, got %+v", override)
+	}
+	if override, ok := parsed.Overrides["explore"]; !ok || override.ThinkingEffort != "medium" || override.ModelID != "9antigravity" {
+		t.Errorf("expected explore alias ThinkingEffort=medium, ModelID=9antigravity, got %+v", override)
+	}
+	if override, ok := parsed.Overrides["debugger"]; !ok || override.ThinkingEffort != "high" || override.ModelID != "claude-3-7-sonnet" {
+		t.Errorf("expected debugger ThinkingEffort=high, ModelID=claude-3-7-sonnet, got %+v", override)
+	}
+	if override, ok := parsed.Overrides["planner"]; !ok || override.ThinkingEffort != "low" || override.ModelID != "custom" {
+		t.Errorf("expected planner ThinkingEffort=low, ModelID=custom, got %+v", override)
+	}
+}
+
+func TestSubagentRunRequestOverridesParentThinkingEffort(t *testing.T) {
+	service := &Service{}
+
+	// Parent chat had effort "high" and passed it in requested_model parameters
+	// but subagent_model_overrides configured Explorer as "medium"
+	message := &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_RunRequest{
+			RunRequest: &agentv1.AgentRunRequest{
+				ConversationId:   proto.String("child-subagent-convo"),
+				SubagentTypeName: proto.String("explore"),
+				RequestedModel: &agentv1.RequestedModel{
+					ModelId: "9antigravity",
+					Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+						{Id: "thinking_effort", Value: "high"}, // Parent's active chat effort
+					},
+				},
+				SubagentModelOverrides: []*agentv1.SubagentModelOverride{
+					{
+						SubagentType: "Explorer",
+						Selection: &agentv1.SubagentModelOverride_Model{
+							Model: &agentv1.RequestedModel{
+								ModelId: "9antigravity",
+								Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+									{Id: "thinking_effort", Value: "medium"}, // Configured explorer effort
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	intent, err := service.decodeInboundIntent("req-1", message, "run_request")
+	if err != nil {
+		t.Fatalf("decodeInboundIntent failed: %v", err)
+	}
+
+	if intent.ThinkingEffort != "medium" {
+		t.Errorf("intent.ThinkingEffort = %q, want %q (should override parent's high effort)", intent.ThinkingEffort, "medium")
+	}
+}
+
+func TestSubagentRunRequestClearsParentThinkingEffortWhenOverrideSpecifiesModelWithoutEffort(t *testing.T) {
+	service := &Service{}
+
+	// Parent chat had effort "high"
+	// Explorer override specifies model "other-model" without explicit effort
+	message := &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_RunRequest{
+			RunRequest: &agentv1.AgentRunRequest{
+				ConversationId:   proto.String("child-subagent-convo"),
+				SubagentTypeName: proto.String("explore"),
+				RequestedModel: &agentv1.RequestedModel{
+					ModelId: "default",
+					Parameters: []*agentv1.RequestedModel_ModelParameterValue{
+						{Id: "thinking_effort", Value: "high"},
+					},
+				},
+				SubagentModelOverrides: []*agentv1.SubagentModelOverride{
+					{
+						SubagentType: "Explorer",
+						Selection: &agentv1.SubagentModelOverride_Model{
+							Model: &agentv1.RequestedModel{
+								ModelId: "custom-explorer-model",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	intent, err := service.decodeInboundIntent("req-1", message, "run_request")
+	if err != nil {
+		t.Fatalf("decodeInboundIntent failed: %v", err)
+	}
+
+	if intent.ModelID != "custom-explorer-model" {
+		t.Errorf("intent.ModelID = %q, want %q", intent.ModelID, "custom-explorer-model")
+	}
+	if intent.ThinkingEffort != "" {
+		t.Errorf("intent.ThinkingEffort = %q, want empty (should not inherit parent's high effort when distinct model is overridden)", intent.ThinkingEffort)
 	}
 }
